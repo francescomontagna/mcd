@@ -19,7 +19,7 @@ def test_mcd_uses_all_eval_samples_without_caps() -> None:
     assert sorted(model.order_) == list(range(3))
     assert model.adjacency_.shape == data.adjacency.shape
     assert 0.0 <= dtop(data.adjacency, model.order_) <= 1.0
-    assert model.env_split_.eval_env == 3
+    assert model.env_split_.eval_env == -1
 
 
 def test_random_baseline_runs() -> None:

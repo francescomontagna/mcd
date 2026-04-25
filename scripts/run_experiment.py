@@ -40,6 +40,7 @@ def main() -> None:
                         help="Minimum pairwise distance in standard-parameter space required across "
                              "at least 3 environments.")
 
+
     # MCD-specific options.
     parser.add_argument("--sink-rule", choices=["variance", "hessian"], default="hessian")
     parser.add_argument("--eta-g", type=float, default=1e-3)
@@ -51,7 +52,7 @@ def main() -> None:
     parser.add_argument("--no-plots", action="store_true")
     args = parser.parse_args()
 
-    outdir = Path(args.outdir)
+    outdir = Path(args.outdir, args.sink_rule)
     outdir.mkdir(parents=True, exist_ok=True)
     rng_master = np.random.default_rng(args.seed)
 
@@ -120,6 +121,10 @@ def main() -> None:
                 rows.append(row)
                 print(f"d={d}, rep={rep}, algorithm={algorithm_name}, dtop={row['dtop']:.4f}")
             print('\n --- \n')
+        
+        current_rows = [row for row in rows if row['d'] == d]
+        dtop_avg = np.mean([row['dtop'] for row in current_rows])
+        print(f"Average dtop for d={d}: {dtop_avg:.4f} \n ------------ \n")
 
     csv_path = outdir / "metrics.csv"
     if rows:

@@ -17,30 +17,33 @@ Aggregate = Literal["sum", "mean"]
 class EnvSplit:
     """Environment assignment used by MCD.
 
-    env 0 is always the base environment. For k=3, no separate evaluation
-    environment is available, so eval_env=0 and env 0 is split into train/eval
-    subsets. For k>3, the last environment is reserved for evaluation.
+    env 0 is always the base. All remaining environments are split alternately
+    into group1 and group2. eval_env=-1 indicates that the evaluation set is
+    constructed internally (held-out portions of every training env for hessian;
+    pooled training data for variance).
     """
 
     base: int
     group1: List[int]
     group2: List[int]
-    eval_env: int
+    eval_env: int  # -1 = no dedicated eval env; eval is pooled from all training envs
 
 
 @dataclass
 class MCDConfig:
     """Configuration for recursive multienvironment causal discovery.
 
-    The implementation is deliberately two-stage:
+    Two-stage pipeline:
+    1. Fit one Stein/KRR score model per training environment.
+    2. Evaluate all fitted score models on a common X_eval, form score-difference
+       ratios pointwise, and identify sinks.
 
-    1. Fit one Stein/KRR score model for each training environment.
-    2. Evaluate all fitted score models on a common evaluation matrix X_eval,
-       then form score-difference ratios pointwise on those evaluation points.
-
-    There are no sample-count caps. The sample counts are controlled by the
-    generated data size n_samples. In the k=3 case, score_train_frac controls
-    how env 0 is split between score fitting and held-out ratio evaluation.
+    score_train_frac sets the total eval-pool size as a fraction of n when
+    sink_rule="hessian": n_eval_total = score_train_frac * n, split equally
+    across all k environments (n_eval_per_env = n_eval_total / k). Each env
+    then uses n - n_eval_per_env samples for score fitting.
+    For sink_rule="variance" no split is performed: all samples are used for
+    score fitting and the full pooled data serves as X_eval.
     """
 
     sink_rule: SinkRule = "hessian"
@@ -56,26 +59,18 @@ class MCDConfig:
 
 
 def make_env_split(k: int) -> EnvSplit:
-    """Return the default base/group/evaluation split.
+    """Assign environments to base / group1 / group2.
 
-    * k=3: base=0, group1={1}, group2={2}, eval_env=0. The base samples are
-      split into training and held-out evaluation subsets.
-    * k>3: base=0, eval_env=k-1, and environments 1,...,k-2 are split
-      alternately into group1 and group2.
+    All k environments participate in score fitting. Environments 1..k-1 are
+    split alternately into group1 and group2. eval_env=-1 because evaluation
+    data is built internally from held-out samples of every training environment.
     """
     if k < 3:
         raise ValueError("MCD needs at least three environments: base + two auxiliary groups.")
-    if k == 3:
-        return EnvSplit(base=0, group1=[1], group2=[2], eval_env=0)
-
-    pool = list(range(1, k - 1))
-    if len(pool) < 2:
-        raise ValueError("Need at least two non-evaluation auxiliary environments.")
+    pool = list(range(1, k))
     group1 = pool[::2]
     group2 = pool[1::2]
-    if not group1 or not group2:
-        group1, group2 = [pool[0]], [pool[1]]
-    return EnvSplit(base=0, group1=group1, group2=group2, eval_env=k - 1)
+    return EnvSplit(base=0, group1=group1, group2=group2, eval_env=-1)
 
 
 def _safe_ratio(num: NDArray, den: NDArray, eps: float) -> NDArray:
@@ -101,8 +96,6 @@ class MCD:
         if X_env.ndim != 3:
             raise ValueError("X_env must have shape (k, n, d).")
         k, n, d = X_env.shape
-        if not 0.0 < self.config.score_train_frac < 1.0:
-            raise ValueError("score_train_frac must be strictly between 0 and 1.")
 
         rng = np.random.default_rng(self.config.random_state)
         split = make_env_split(k)
@@ -137,15 +130,6 @@ class MCD:
         self.adjacency_ = full_dag_from_order(self.order_)
         return self
 
-    def _base_train_eval_indices(self, n: int, rng: np.random.Generator) -> Tuple[NDArray, NDArray]:
-        """Split env 0 when k=3 and env 0 must also provide evaluation points."""
-        perm = rng.permutation(n)
-        n_train = int(round(self.config.score_train_frac * n))
-        n_train = min(max(n_train, 2), n - 2)
-        train_idx = np.sort(perm[:n_train])
-        eval_idx = np.sort(perm[n_train:])
-        return train_idx, eval_idx
-
     def _fit_scores_and_compute_ratio(
         self,
         X_env: NDArray,
@@ -153,30 +137,39 @@ class MCD:
         split: EnvSplit,
         rng: np.random.Generator,
     ) -> Tuple[NDArray, NDArray, Dict[int, SteinScoreModel]]:
-        """Fit score KRR models, evaluate them on common X_eval, and form ratios."""
+        """Fit score models on all training envs and evaluate on a common X_eval.
+
+        variance: no held-out split; all n samples used for score fitting. X_eval
+          is the concatenation of all training data (in-sample evaluation is
+          harmless for the variance criterion).
+        hessian: each env is shuffled and split at n_train=round(score_train_frac*n).
+          Held-out rows from all envs are concatenated into the eval pool, using
+          all available held-out samples (no subsampling).
+        """
         k, n, _ = X_env.shape
         active_arr = np.asarray(active, dtype=int)
         fit_envs = [split.base] + split.group1 + split.group2
 
-        base_train_idx: Optional[NDArray] = None
-        if split.eval_env == split.base:
-            base_train_idx, eval_idx = self._base_train_eval_indices(n, rng)
-            X_eval = X_env[split.base][eval_idx][:, active_arr]
+        if self.config.sink_rule == "variance":
+            train_by_env = {e: X_env[e][:, active_arr] for e in fit_envs}
+            X_eval = np.concatenate([train_by_env[e] for e in fit_envs], axis=0)
         else:
-            X_eval = X_env[split.eval_env][:, active_arr]
-
-        train_blocks: List[NDArray] = []
-        train_by_env: Dict[int, NDArray] = {}
-        for e in fit_envs:
-            if e == split.base and base_train_idx is not None:
-                X_train_e = X_env[e][base_train_idx][:, active_arr]
-            else:
-                X_train_e = X_env[e][:, active_arr]
-            train_by_env[e] = X_train_e
-            train_blocks.append(X_train_e)
+            if not 0.0 < self.config.score_train_frac < 1.0:
+                raise ValueError("score_train_frac must be strictly between 0 and 1 for hessian.")
+            # score_train_frac sets the TOTAL eval size as a fraction of n;
+            # that budget is distributed equally across all k training environments.
+            n_eval_per_env = max(1, int(round(self.config.score_train_frac * n / len(fit_envs))))
+            n_train = max(2, n - n_eval_per_env)
+            train_by_env: Dict[int, NDArray] = {}
+            eval_parts: List[NDArray] = []
+            for e in fit_envs:
+                perm = rng.permutation(n)
+                train_by_env[e] = X_env[e][perm[:n_train]][:, active_arr]
+                eval_parts.append(X_env[e][perm[n_train:]][:, active_arr])
+            X_eval = np.concatenate(eval_parts, axis=0)
 
         if self.config.standardize:
-            pooled = np.vstack(train_blocks + [X_eval])
+            pooled = np.concatenate(list(train_by_env.values()) + [X_eval], axis=0)
             mean, std = standardize_fit(pooled)
             X_eval_used = standardize_apply(X_eval, mean, std)
         else:
