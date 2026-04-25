@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcd-synthetic"
+version = "0.1.0"
+description = "Synthetic multienvironment causal discovery experiments with Stein score-ratio sink peeling."
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.23",
+    "matplotlib>=3.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcd*"]

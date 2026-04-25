@@ -1,0 +1,19 @@
+{
+  "outdir": "outputs/quick",
+  "seed": 0,
+  "n_reps": 3,
+  "d_list": "5",
+  "density": 0.3,
+  "n_samples": 300,
+  "n_envs": 4,
+  "mechanism": "mixed",
+  "noise": "gaussian",
+  "algorithms": "mcd,random",
+  "sink_rule": "hessian",
+  "eta_g": 0.01,
+  "eta_h": 0.01,
+  "krr_reg": 0.0001,
+  "denominator_eps": 0.001,
+  "score_train_frac": 0.5,
+  "aggregate_envs": "sum"
+}
