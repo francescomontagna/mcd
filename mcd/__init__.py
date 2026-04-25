@@ -1,6 +1,6 @@
 from .algorithm import MCD, MCDConfig, make_env_split
 from .baselines import RandomOrderBaseline, RandomOrderConfig
-from .data import EnvShiftConfig, SCMData, sample_multienv_scm
+from .data import ExpFamilyConfig, SCMData, sample_multienv_scm
 from .graphs import DAGConfig, sample_erdos_renyi_dag, topological_order
 from .metrics import dtop
 
@@ -10,7 +10,7 @@ __all__ = [
     "make_env_split",
     "RandomOrderBaseline",
     "RandomOrderConfig",
-    "EnvShiftConfig",
+    "ExpFamilyConfig",
     "SCMData",
     "sample_multienv_scm",
     "DAGConfig",

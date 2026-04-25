@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass
+from itertools import combinations
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -9,17 +11,137 @@ from .graphs import DAGConfig, sample_dag, topological_order
 from .mechanisms import NodeMechanism, build_mechanisms
 
 
-@dataclass
-class EnvShiftConfig:
-    """Location-scale shifts for source distributions across environments."""
+# ---------------------------------------------------------------------------
+# Exponential family specifications
+# ---------------------------------------------------------------------------
+# Gaussian N(mu, sigma^2):  natural params eta = [eta1, eta2]
+#   eta1 = mu / sigma^2,   eta2 = -1 / (2 * sigma^2)
+#   base distribution N(0, 1):  eta_base = [0.0, -0.5]
+#   most_meaningful_idx = 1  (eta2 controls variance)
+#   std_ranges: sampling intervals in (mu, sigma) space for auxiliary envs
+#               sigma range [0.5, 4.0] gives eta2 in [-2.0, -0.0625]
 
-    intervention_frac: float = 1.0
-    mu_range: Tuple[float, float] = (-1.0, 1.0)
-    sigma_range: Tuple[float, float] = (0.75, 1.35)
-    ensure_first_two_strong: bool = True
-    first_two_mu: Tuple[Tuple[float, float], Tuple[float, float]] = ((0.7, 1.2), (-1.2, -0.7))
-    first_two_sigma: Tuple[float, float] = (0.8, 1.25)
-    student_t_df: int = 6
+_FAMILY_SPECS: Dict[str, Dict[str, Any]] = {
+    "gaussian": {
+        "n_params": 2,
+        "base_eta": np.array([0.0, -0.5]),
+        "most_meaningful_idx": 1,
+        "std_ranges": [(-2.0, 2.0), (0.5, 4.0)],  # (mu_range, sigma_range)
+    },
+    # Exponential Exp(lambda):  p(x|eta) = exp(eta*x - log(-eta))  for x >= 0
+    #   eta = -lambda  (eta < 0),  base Exp(1): eta_base = [-1.0]
+    #   lambda range [0.5, 4.0] <-> eta range [-4.0, -0.5]
+    "exponential": {
+        "n_params": 1,
+        "base_eta": np.array([-1.0]),
+        "most_meaningful_idx": 0,
+        "std_ranges": [(0.5, 4.0)],  # lambda_range
+    },
+}
+
+
+def _eta_to_std_gaussian(eta: np.ndarray) -> Tuple[float, float]:
+    sigma2 = -1.0 / (2.0 * eta[1])
+    mu = -eta[0] / (2.0 * eta[1])
+    return float(mu), float(np.sqrt(sigma2))
+
+
+def _std_to_eta_gaussian(mu: float, sigma: float) -> np.ndarray:
+    sigma2 = sigma ** 2
+    return np.array([mu / sigma2, -1.0 / (2.0 * sigma2)])
+
+
+def _draw_aux_eta_gaussian(
+    base_eta: np.ndarray,
+    std_ranges: List[Tuple[float, float]],
+    shift_all: bool,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    sigma = rng.uniform(std_ranges[1][0], std_ranges[1][1])
+    if shift_all:
+        mu = rng.uniform(std_ranges[0][0], std_ranges[0][1])
+    else:
+        mu, _ = _eta_to_std_gaussian(base_eta)
+    return _std_to_eta_gaussian(mu, sigma)
+
+
+def _draw_aux_eta_exponential(std_ranges: List[Tuple[float, float]], rng: np.random.Generator) -> np.ndarray:
+    lam = rng.uniform(std_ranges[0][0], std_ranges[0][1])
+    return np.array([-lam])
+
+
+def _draw_aux_eta(cfg: ExpFamilyConfig, rng: np.random.Generator) -> np.ndarray:
+    spec = _FAMILY_SPECS[cfg.family]
+    if cfg.family == "gaussian":
+        return _draw_aux_eta_gaussian(spec["base_eta"], spec["std_ranges"], cfg.shift_all_eta, rng)
+    if cfg.family == "exponential":
+        return _draw_aux_eta_exponential(spec["std_ranges"], rng)
+    raise ValueError(f"Unknown exponential family: {cfg.family!r}")
+
+
+def _sample_from_eta(family: str, eta: np.ndarray, n: int, rng: np.random.Generator) -> np.ndarray:
+    if family == "gaussian":
+        mu, sigma = _eta_to_std_gaussian(eta)
+        return rng.normal(mu, sigma, size=n)
+    if family == "exponential":
+        lam = -eta[0]
+        return rng.exponential(scale=1.0 / lam, size=n)
+    raise ValueError(f"Unknown family: {family!r}")
+
+
+def _node_dist(family: str, eta_a: np.ndarray, eta_b: np.ndarray, shift_all: bool) -> float:
+    if family == "gaussian":
+        mu_a, sigma_a = _eta_to_std_gaussian(eta_a)
+        mu_b, sigma_b = _eta_to_std_gaussian(eta_b)
+        if shift_all:
+            return float(np.sqrt((mu_a - mu_b) ** 2 + (sigma_a - sigma_b) ** 2))
+        return abs(sigma_a - sigma_b)
+    if family == "exponential":
+        # distance in lambda space; shift_all irrelevant (single parameter)
+        return abs(float(-eta_a[0] - (-eta_b[0])))
+    raise ValueError(f"Unknown family: {family!r}")
+
+
+def _pairwise_env_distances(
+    eta: np.ndarray,  # (k, d, n_params)
+    family: str,
+    shift_all: bool,
+) -> np.ndarray:
+    k, d = eta.shape[:2]
+    dist = np.zeros((k, k))
+    for e1, e2 in combinations(range(k), 2):
+        node_dists = [_node_dist(family, eta[e1, j], eta[e2, j], shift_all) for j in range(d)]
+        dist[e1, e2] = dist[e2, e1] = float(np.mean(node_dists))
+    return dist
+
+
+def _is_diverse_enough(
+    eta: np.ndarray,
+    family: str,
+    shift_all: bool,
+    min_env_diff: float,
+    min_sufficient_envs: int,
+) -> bool:
+    """True if at least min_sufficient_envs environments are mutually >= min_env_diff apart."""
+    k = eta.shape[0]
+    if min_sufficient_envs > k:
+        return True
+    dist = _pairwise_env_distances(eta, family, shift_all)
+    sufficient = dist >= min_env_diff
+    for subset in combinations(range(k), min_sufficient_envs):
+        if all(sufficient[e1, e2] for e1, e2 in combinations(subset, 2)):
+            return True
+    return False
+
+
+@dataclass
+class ExpFamilyConfig:
+    """Exponential family source distribution configuration."""
+    family: str = "gaussian"
+    shift_all_eta: bool = False
+    min_env_diff: float = 1.0
+    min_sufficient_envs: int = 3
+    max_retries: int = 500
 
 
 @dataclass
@@ -32,88 +154,43 @@ class SCMData:
     env_params: Dict[str, Any]
 
 
-def _standardized_noise(n: int, d: int, dist: str, rng: np.random.Generator, cfg: EnvShiftConfig) -> np.ndarray:
-    dist = dist.lower()
-    if dist in {"gaussian", "normal"}:
-        return rng.normal(0.0, 1.0, size=(n, d))
-    if dist == "laplace":
-        return rng.laplace(0.0, 1 / np.sqrt(2), size=(n, d))
-    if dist in {"student_t", "t"}:
-        df = cfg.student_t_df
-        u = rng.standard_t(df, size=(n, d))
-        if df > 2:
-            u = u / np.sqrt(df / (df - 2))
-        return u
-    if dist == "gamma":
-        shape, scale = 2.0, 1.0
-        u = rng.gamma(shape, scale, size=(n, d))
-        return (u - shape * scale) / np.sqrt(shape * scale**2)
-    if dist == "exponential":
-        return rng.exponential(1.0, size=(n, d)) - 1.0
-    raise ValueError(f"Unknown noise distribution: {dist}")
-
-
-# NOTE: i am unhappy of how this is handled. We need to make interventions more effective
 def sample_sources(
     k: int,
     n: int,
     d: int,
-    noise: Union[str, Sequence[str]],
+    cfg: ExpFamilyConfig,
     rng: np.random.Generator,
-    shift: Optional[EnvShiftConfig] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Sample independent source variables for k environments."""
-    if shift is None:
-        shift = EnvShiftConfig()
-    noises = [noise] * k if isinstance(noise, str) else list(noise)
-    if len(noises) < k:
-        noises = noises + [noises[-1]] * (k - len(noises))
+    """Sample k environments of independent source variables from the exponential family.
 
-    mu = np.zeros((k, d), dtype=float)
-    sigma = np.ones((k, d), dtype=float)
+    Auxiliary environments (1..k-1) have per-node natural parameters eta sampled
+    uniformly in standard-parameter space (mu, sigma for Gaussian) then converted
+    to natural parameters.  A rejection loop ensures at least cfg.min_sufficient_envs
+    environments are mutually separated by >= cfg.min_env_diff (in standard-param space).
+    """
+    spec = _FAMILY_SPECS[cfg.family]
+    base_eta: np.ndarray = spec["base_eta"]
 
-    m = max(1, int(round(shift.intervention_frac * d)))
-    m = min(m, d)
+    eta_all = np.tile(base_eta, (k, d, 1))  # (k, d, n_params); env 0 always uses base params
+    for _ in range(cfg.max_retries):
+        eta_all = np.tile(base_eta, (k, d, 1))
+        for e in range(1, k):
+            for j in range(d):
+                eta_all[e, j] = _draw_aux_eta(cfg, rng)
+        if _is_diverse_enough(eta_all, cfg.family, cfg.shift_all_eta, cfg.min_env_diff, cfg.min_sufficient_envs):
+            break
+    else:
+        warnings.warn(
+            f"Could not satisfy min_env_diff={cfg.min_env_diff} within {cfg.max_retries} retries; "
+            "using last sampled configuration."
+        )
 
-    def choose_nodes(exclude: Optional[np.ndarray] = None) -> np.ndarray:
-        nodes = np.arange(d)
-        if exclude is not None and exclude.size > 0:
-            nodes = np.setdiff1d(nodes, exclude, assume_unique=False)
-        if nodes.size <= m:
-            return nodes
-        return rng.choice(nodes, size=m, replace=False)
-
-    if k > 1:
-        if shift.ensure_first_two_strong:
-            idx1 = choose_nodes()
-            lo, hi = shift.first_two_mu[0]
-            slo, shi = shift.first_two_sigma
-            mu[1, idx1] = rng.uniform(lo, hi, size=idx1.size)
-            sigma[1, idx1] = rng.uniform(slo, shi, size=idx1.size)
-
-            if k > 2:
-                # If intervention_frac=1, env1 and env2 both shift all nodes.
-                exclude = idx1 if shift.intervention_frac < 0.999 else None
-                idx2 = choose_nodes(exclude=exclude)
-                lo, hi = shift.first_two_mu[1]
-                mu[2, idx2] = rng.uniform(lo, hi, size=idx2.size)
-                sigma[2, idx2] = rng.uniform(slo, shi, size=idx2.size)
-
-            start = 3
-        else:
-            start = 1
-
-        for e in range(start, k):
-            idx = choose_nodes()
-            mu[e, idx] = rng.uniform(*shift.mu_range, size=idx.size)
-            sigma[e, idx] = rng.uniform(*shift.sigma_range, size=idx.size)
-
-    S_envs = []
+    S = np.zeros((k, n, d))
     for e in range(k):
-        u = _standardized_noise(n, d, noises[e], rng, shift) # NOTE: do I want standardization?
-        S_envs.append(mu[e] + sigma[e] * u)
-    S = np.stack(S_envs, axis=0)
-    return S, {"mu": mu, "sigma": sigma, "noise": noises, "shift_config": shift.__dict__}
+        for j in range(d):
+            S[e, :, j] = _sample_from_eta(cfg.family, eta_all[e, j], n, rng)
+
+    return S, {"eta": eta_all, "family": cfg.family, "shift_all_eta": cfg.shift_all_eta}
 
 
 def sample_from_scm(
@@ -142,16 +219,10 @@ def sample_multienv_scm(
     order: Optional[List[int]] = None,
     dag_config: Optional[DAGConfig] = None,
     mechanism: Union[str, Sequence[Union[str, NodeMechanism]]] = "mixed",
-    noise: Union[str, Sequence[str]] = "gaussian",
     rng: Optional[np.random.Generator] = None,
-    shift: Optional[EnvShiftConfig] = None,
+    exp_family_cfg: Optional[ExpFamilyConfig] = None,
 ) -> SCMData:
-    """End-to-end synthetic data generation.
-
-    This is the main entry point. It supports controllable graph size/density,
-    modular mechanisms, edge-level mixed mechanisms, custom mechanisms, and an
-    arbitrary number of environments.
-    """
+    """End-to-end synthetic data generation for multi-environment causal discovery."""
     if rng is None:
         rng = np.random.default_rng()
     if adjacency is None:
@@ -164,9 +235,11 @@ def sample_multienv_scm(
             order = topological_order(adjacency)
     if order is None:
         order = topological_order(adjacency)
+    if exp_family_cfg is None:
+        exp_family_cfg = ExpFamilyConfig()
 
     d = adjacency.shape[0]
     mechanisms = build_mechanisms(adjacency, mechanism, rng)
-    S, env_params = sample_sources(k, n, d, noise, rng, shift)
+    S, env_params = sample_sources(k, n, d, exp_family_cfg, rng)
     X = sample_from_scm(adjacency, order, mechanisms, S)
     return SCMData(X=X, S=S, adjacency=adjacency, order=order, mechanisms=mechanisms, env_params=env_params)

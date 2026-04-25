@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from mcd import DAGConfig, EnvShiftConfig, MCD, MCDConfig, RandomOrderBaseline, RandomOrderConfig, dtop, sample_multienv_scm
+from mcd import DAGConfig, ExpFamilyConfig, MCD, MCDConfig, RandomOrderBaseline, RandomOrderConfig, dtop, sample_multienv_scm
 
 
 def test_mcd_uses_all_eval_samples_without_caps() -> None:
@@ -12,9 +12,8 @@ def test_mcd_uses_all_eval_samples_without_caps() -> None:
         n=24,
         dag_config=DAGConfig(d=3, density=0.35),
         mechanism="mixed",
-        noise="gaussian",
         rng=rng,
-        shift=EnvShiftConfig(intervention_frac=1.0),
+        exp_family_cfg=ExpFamilyConfig(family="gaussian"),
     )
     model = MCD(MCDConfig(sink_rule="variance", random_state=123)).fit(data.X)
     assert sorted(model.order_) == list(range(3))

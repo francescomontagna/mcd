@@ -9,7 +9,7 @@ from typing import List
 
 import numpy as np
 
-from mcd import DAGConfig, EnvShiftConfig, dtop, sample_multienv_scm
+from mcd import DAGConfig, ExpFamilyConfig, dtop, sample_multienv_scm
 from mcd.plotting import plot_dtop_bars
 from mcd.registry import make_algorithm_factories, parse_algorithm_list
 
@@ -24,12 +24,21 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-reps", type=int, default=10)
     parser.add_argument("--d-list", type=str, default="5")
-    parser.add_argument("--density", type=float, default=0.3)
+    parser.add_argument("--density", type=str, default="0.3", help="Comma-separated list of densities (edge probabilities) for each d in d_list.")
     parser.add_argument("--n-samples", type=int, default=1000)
     parser.add_argument("--n-envs", type=int, default=4)
     parser.add_argument("--mechanism", type=str, default="mixed")
-    parser.add_argument("--noise", type=str, default="gaussian")
     parser.add_argument("--algorithms", type=str, default="mcd,random", help="Comma-separated list, e.g. mcd,random.")
+
+    # Exponential family source distribution options.
+    parser.add_argument("--exp-family", type=str, default="gaussian",
+                        help="Exponential family density type for source distributions (e.g. gaussian).")
+    parser.add_argument("--shift-all-eta", action="store_true",
+                        help="Shift all natural parameters eta; default shifts only the most meaningful one "
+                             "(variance for gaussian).")
+    parser.add_argument("--min-env-diff", type=float, default=1.0,
+                        help="Minimum pairwise distance in standard-parameter space required across "
+                             "at least 3 environments.")
 
     # MCD-specific options.
     parser.add_argument("--sink-rule", choices=["variance", "hessian"], default="hessian")
@@ -58,24 +67,36 @@ def main() -> None:
         aggregate_envs=args.aggregate_envs,
     )
 
+    exp_family_cfg = ExpFamilyConfig(
+        family=args.exp_family,
+        shift_all_eta=args.shift_all_eta,
+        min_env_diff=args.min_env_diff,
+    )
+
     rows = []
     run_config = vars(args).copy()
     (outdir / "config.json").write_text(json.dumps(run_config, indent=2, sort_keys=True))
 
-    for d in parse_d_list(args.d_list):
+    densities = [float(density) for density in args.density.split(",")]
+    assert len(densities) == 1 or len(densities) == len(parse_d_list(args.d_list)), (
+        "Provide either a single density value or one per d in d_list."
+    )
+
+    for i, d in enumerate(parse_d_list(args.d_list)):
+        density = densities[i] if len(densities) > 1 else densities[0]
         for rep in range(args.n_reps):
             data_seed = int(rng_master.integers(0, 2**31 - 1))
             rng = np.random.default_rng(data_seed)
             data = sample_multienv_scm(
                 k=args.n_envs,
                 n=args.n_samples,
-                dag_config=DAGConfig(d=d, density=args.density, graph_type="erdos_renyi"),
+                dag_config=DAGConfig(d=d, density=density, graph_type="erdos_renyi"),
                 mechanism=args.mechanism,
-                noise=args.noise,
                 rng=rng,
-                shift=EnvShiftConfig(intervention_frac=1.0),
+                exp_family_cfg=exp_family_cfg,
             )
 
+            print(f"Number of edges: {data.adjacency.sum()}")
             for alg_offset, (algorithm_name, factory) in enumerate(factories.items()):
                 alg_seed = data_seed + 10_000 * (alg_offset + 1)
                 model = factory(alg_seed).fit(data.X)
@@ -89,7 +110,9 @@ def main() -> None:
                     "n_samples": args.n_samples,
                     "n_envs": args.n_envs,
                     "mechanism": args.mechanism,
-                    "noise": args.noise,
+                    "exp_family": args.exp_family,
+                    "shift_all_eta": args.shift_all_eta,
+                    "min_env_diff": args.min_env_diff,
                     "dtop": dtop(data.adjacency, model.order_),
                     "true_order": json.dumps([int(x) for x in data.order]),
                     "estimated_order": json.dumps([int(x) for x in model.order_]),
