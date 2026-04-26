@@ -36,19 +36,22 @@ There are no training/evaluation sample caps. The user controls sample size thro
 `scripts/run_experiment.py` accepts:
 
 ```bash
---algorithms mcd,random
+--algorithms mcd-variance,mcd-hessian,random
 ```
 
 All listed algorithms must run on the same generated dataset for a given repetition. Add new algorithms through the registry in `mcd/registry.py`.
 
+`--n-samples` and `--krr-reg` accept comma-separated lists; the script sweeps over their full cross product (along with `--d-list` and `--n-reps`) and writes every row to a single `metrics.csv`.
+
 Current algorithms:
 
-- `mcd`: score-ratio sink peeling.
+- `mcd-variance`: score-ratio sink peeling with the variance sink rule.
+- `mcd-hessian`: score-ratio sink peeling with the hessian sink rule.
 - `random`: random order baseline.
 
 ## Plotting
 
-The plotting function should create one bar chart per graph size. Each chart has one bar per algorithm. Bar height is mean `Dtop`; error bar is a 95% confidence interval.
+The plotting function should produce one bar chart per `(n_samples, mcd-variant)` pair. Within each chart the x-axis is the number of nodes; each `d` group shows one bar per hyperparameter combination (currently the swept `krr_reg` values). Bar height is mean `Dtop`; error bar is a 95% confidence interval.
 
 ## Before finishing changes
 
@@ -61,5 +64,5 @@ pytest -q
 or at least a small smoke command such as:
 
 ```bash
-python scripts/run_experiment.py --algorithms mcd,random --n-reps 1 --d-list 3 --n-samples 20 --n-envs 4 --sink-rule variance --no-plots
+python scripts/run_experiment.py --algorithms mcd-variance,mcd-hessian,random --n-reps 1 --d-list 3 --n-samples 20 --n-envs 4 --no-plots
 ```
