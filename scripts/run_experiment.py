@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 from typing import List
 
@@ -19,7 +20,7 @@ _FIELDNAMES = [
     "algorithm", "rep", "data_seed", "algorithm_seed", "d", "density",
     "n_samples", "n_envs", "mechanism", "exp_family", "shift_all_eta",
     "min_env_diff", "krr_reg", "eta_stein", "score_train_frac",
-    "aggregate_envs", "dtop", "true_order", "estimated_order",
+    "aggregate_envs", "dtop", "true_order", "estimated_order", "elapsed_s",
 ]
 
 
@@ -155,7 +156,9 @@ def main() -> None:
                                 score_train_frac=args.score_train_frac,
                                 aggregate_envs=args.aggregate_envs,
                             )
+                            t0 = time.perf_counter()
                             model = factory(alg_seed).fit(data.X)
+                            elapsed_s = time.perf_counter() - t0
                             row = {
                                 "algorithm": algorithm_name,
                                 "rep": rep,
@@ -176,6 +179,7 @@ def main() -> None:
                                 "dtop": dtop(data.adjacency, model.order_),
                                 "true_order": json.dumps([int(x) for x in data.order]),
                                 "estimated_order": json.dumps([int(x) for x in model.order_]),
+                                "elapsed_s": elapsed_s,
                             }
                             rep_rows.append(row)
                             if is_mcd:

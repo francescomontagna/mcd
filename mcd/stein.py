@@ -44,13 +44,25 @@ class SteinMixin:
     """
 
     def hessian(self, X: NDArray, eta_G: float, eta_H: float) -> NDArray:
-        _, d = X.shape
+        n, d = X.shape
         s = kernel_width(X)
         K = self._evaluate_kernel(X, s=s)
         nablaK = self._evaluate_nablaK(K, X, s)
         G = self.score(X, eta_G, K, nablaK)
-        H = np.stack([self._hessian_col(X, G, col, eta_H, K, s) for col in range(d)], axis=1)
-        return H
+
+        X_diff = self._X_diff(X)  # (n, n, d)
+        # nabla2vK[c, i, j] = sum_k X_diff[i,k,c] * X_diff[i,k,j] * K[i,k] / s^4
+        nabla2vK = np.einsum("ikc,ikj,ik->cij", X_diff, X_diff, K) / s**4  # (d, n, d)
+        diag_corr = K.sum(axis=1) / s**2  # (n,)
+        for c in range(d):
+            nabla2vK[c, :, c] -= diag_corr
+
+        # Single LU factorization for all d column systems.
+        # Gv is subtracted after the solve (original: H_col = -Gv + solve(K, nabla2vK)).
+        rhs = nabla2vK.transpose(1, 0, 2).reshape(n, d * d)  # (n, d*d)
+        H_flat = np.linalg.solve(K + eta_H * np.eye(n), rhs)  # (n, d*d)
+        Gv = np.einsum("ic,ij->cij", G, G)  # (d, n, d): Gv[c,i,j] = G[i,c]*G[i,j]
+        return H_flat.reshape(n, d, d) - Gv.transpose(1, 0, 2)
 
     def score(
         self,
@@ -66,14 +78,6 @@ class SteinMixin:
             nablaK = self._evaluate_nablaK(K, X, s)
         assert nablaK is not None
         return np.linalg.solve(K + eta_G * np.eye(n), nablaK)
-
-    def _hessian_col(self, X: NDArray, G: NDArray, c: int, eta: float, K: NDArray, s: float) -> NDArray:
-        X_diff = self._X_diff(X)
-        Gv = np.einsum("i,ij->ij", G[:, c], G)
-        nabla2vK = np.einsum("ik,ikj,ik->ij", X_diff[:, :, c], X_diff, K) / s**4
-        nabla2vK[:, c] -= np.einsum("ik->i", K) / s**2
-        H_col = -Gv + np.linalg.solve(K + eta * np.eye(X.shape[0]), nabla2vK)
-        return H_col
 
     def hessian_diagonal(self, X: NDArray, eta_G: float, eta_H: float) -> NDArray:
         n, _ = X.shape
