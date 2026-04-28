@@ -58,7 +58,16 @@ def main() -> None:
     parser.add_argument("--n-samples", type=str, default="1000",
                         help="Comma-separated list of sample sizes per environment, e.g. 1000,2000,3000.")
     parser.add_argument("--n-envs", type=int, default=4)
-    parser.add_argument("--mechanism", type=str, default="mixed")
+    parser.add_argument("--mechanism", type=str, default="mixed",
+                        help="Structural mechanism for each node. Choices: "
+                             "linear (linear additive noise), "
+                             "anm/tanh (nonlinear additive noise, tanh), "
+                             "pnl (post-nonlinear), "
+                             "lsnm/location_scale (location-scale noise), "
+                             "tanh_cubic (non-additive tanh+cubic), "
+                             "nn/neural_net (non-additive neural network), "
+                             "gp (non-additive Gaussian process), "
+                             "mixed (randomly samples from all of the above per node).")
     parser.add_argument("--algorithms", type=str, default="mcd-variance,mcd-hessian",
                         help=f"Comma-separated list, choose from: {','.join(MCD_VARIANTS.keys())},random.")
 
@@ -119,9 +128,9 @@ def main() -> None:
     total_reps = len(d_list) * len(n_samples_list) * args.n_reps
     pbar = tqdm(total=total_reps, desc="Sweep", file=sys.__stdout__)
 
-    for i, d in enumerate(d_list):
-        density = densities[i] if len(densities) > 1 else densities[0]
-        for n_samples in n_samples_list:
+    for n_samples in n_samples_list:
+        for i, d in enumerate(d_list):
+            density = densities[i] if len(densities) > 1 else densities[0]
             for rep in range(args.n_reps):
                 data_seed = int(rng_master.integers(0, 2**31 - 1))
                 rng = np.random.default_rng(data_seed)
@@ -205,6 +214,9 @@ def main() -> None:
                     f"Average dtop for d={d}, n_samples={n_samples}: "
                     f"{dtop_avg:.4f} \n ------------ \n"
                 )
+
+        if rows and not args.no_plots:
+            plot_dtop_hyperparam_grid(str(csv_path), str(outdir))
 
     pbar.close()
 

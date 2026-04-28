@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Sequence, Union
 
 import numpy as np
 
 Array = np.ndarray
 
+_N_HIDDEN = 16
+_N_RFF = 32
+_GP_LENGTH_SCALE = 1.0
+
 
 class NodeMechanism:
-    """Base class for mechanisms x_i = F_i(x_pa(i), s_i).
-
-    Implementations must be invertible in the scalar source s_i for every fixed
-    parent value. The sampler only needs the forward map.
-    """
+    """Base class for mechanisms x_i = F_i(x_pa(i), s_i)."""
 
     name: str = "base"
 
@@ -32,6 +32,11 @@ class RootMechanism(NodeMechanism):
         return source
 
 
+# ---------------------------------------------------------------------------
+# Additive noise mechanisms
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class LinearAdditive(NodeMechanism):
     weights: Array
@@ -45,7 +50,8 @@ class LinearAdditive(NodeMechanism):
 
 
 @dataclass
-class TanhAdditive(NodeMechanism):
+class NonlinearAdditive(NodeMechanism):
+    """x = tanh(pa @ w) + s"""
     weights: Array
     name: str = "anm_tanh"
 
@@ -57,94 +63,8 @@ class TanhAdditive(NodeMechanism):
 
 
 @dataclass
-class SensorWarp(NodeMechanism):
-    weights_linear: Array
-    weights_nonlinear: Array
-    c: float
-    name: str = "sensor_warp"
-
-    @staticmethod
-    def _phi(u: Array, c: float) -> Array:
-        # Strictly increasing when |c| < 1.
-        return u + c * np.tanh(u)
-
-    def __call__(self, parents: Array, source: Array) -> Array:
-        latent = parents @ self.weights_linear + np.tanh(parents @ self.weights_nonlinear) + source
-        return self._phi(latent, self.c)
-
-    def metadata(self) -> Dict[str, object]:
-        return {
-            "name": self.name,
-            "weights_linear": self.weights_linear.tolist(),
-            "weights_nonlinear": self.weights_nonlinear.tolist(),
-            "c": self.c,
-        }
-
-
-@dataclass
-class LocationScaleCubic(NodeMechanism):
-    weights_g: Array
-    weights_h: Array
-    hmin: float = 0.7
-    hmax: float = 1.3
-    eta: float = 0.05
-    name: str = "location_scale_cubic"
-
-    def _gain(self, parents: Array) -> Array:
-        t = parents @ self.weights_h
-        sig = 1.0 / (1.0 + np.exp(-np.clip(t, -40, 40)))
-        return self.hmin + (self.hmax - self.hmin) * sig
-
-    def __call__(self, parents: Array, source: Array) -> Array:
-        g = np.tanh(parents @ self.weights_g)
-        h = self._gain(parents)
-        psi = source + self.eta * source**3
-        return g + h * psi
-
-    def metadata(self) -> Dict[str, object]:
-        return {
-            "name": self.name,
-            "weights_g": self.weights_g.tolist(),
-            "weights_h": self.weights_h.tolist(),
-            "hmin": self.hmin,
-            "hmax": self.hmax,
-            "eta": self.eta,
-        }
-
-
-@dataclass
-class ParentDependentWarp(NodeMechanism):
-    weights_g: Array
-    weights_lam: Array
-    weights_c: Array
-    lam_min: float = 1.0
-    lam_max: float = 1.6
-    c_max: float = 0.5
-    name: str = "parent_dependent_warp"
-
-    def __call__(self, parents: Array, source: Array) -> Array:
-        g = np.tanh(parents @ self.weights_g)
-        t_lam = parents @ self.weights_lam
-        sig = 1.0 / (1.0 + np.exp(-np.clip(t_lam, -40, 40)))
-        lam = self.lam_min + (self.lam_max - self.lam_min) * sig
-        c = self.c_max * np.tanh(parents @ self.weights_c)
-        # derivative wrt source is lam + c * sech(source)^2 >= lam_min - c_max > 0.
-        return g + lam * source + c * np.tanh(source)
-
-    def metadata(self) -> Dict[str, object]:
-        return {
-            "name": self.name,
-            "weights_g": self.weights_g.tolist(),
-            "weights_lam": self.weights_lam.tolist(),
-            "weights_c": self.weights_c.tolist(),
-            "lam_min": self.lam_min,
-            "lam_max": self.lam_max,
-            "c_max": self.c_max,
-        }
-
-
-@dataclass
 class PostNonlinear(NodeMechanism):
+    """x = z + c*tanh(z)  where  z = tanh(pa @ w) + s"""
     weights: Array
     c: float
     name: str = "pnl"
@@ -158,57 +78,116 @@ class PostNonlinear(NodeMechanism):
 
 
 @dataclass
-class MixedEdgeMechanism(NodeMechanism):
-    """A node mechanism whose parent-specific edge functions are sampled uniformly.
-
-    The mechanism is
-        x_i = sum_j phi_j(x_j) + h(x_pa) * (s_i + eta s_i^3),
-    where every phi_j is sampled independently from a small library. This gives
-    the requested "mixed mechanism" at the edge level while retaining
-    invertibility in s_i because h(x_pa) is positive.
-    """
-
-    edge_types: List[str]
-    edge_weights: Array
-    gain_weights: Array
-    eta: float = 0.03
-    hmin: float = 0.8
-    hmax: float = 1.2
-    name: str = "mixed"
-
-    def _edge_eval(self, x: Array, typ: str, w: float) -> Array:
-        if typ == "linear":
-            return w * x
-        if typ == "tanh":
-            return w * np.tanh(x)
-        if typ == "sin":
-            return w * np.sin(x)
-        if typ == "softsign":
-            return w * x / (1.0 + np.abs(x))
-        if typ == "cubic_mild":
-            return w * (x + 0.05 * x**3)
-        raise ValueError(f"Unknown edge type: {typ}")
+class LocationScaleNoise(NodeMechanism):
+    """x = tanh(pa @ g) + h(pa) * (s + eta*s^3)"""
+    weights_g: Array
+    weights_h: Array
+    eta: float = 0.05
+    hmin: float = 0.7
+    hmax: float = 1.3
+    name: str = "lsnm"
 
     def _gain(self, parents: Array) -> Array:
-        t = parents @ self.gain_weights
+        t = parents @ self.weights_h
         sig = 1.0 / (1.0 + np.exp(-np.clip(t, -40, 40)))
         return self.hmin + (self.hmax - self.hmin) * sig
 
     def __call__(self, parents: Array, source: Array) -> Array:
-        edge_sum = np.zeros(parents.shape[0])
-        for j, typ in enumerate(self.edge_types):
-            edge_sum += self._edge_eval(parents[:, j], typ, float(self.edge_weights[j]))
-        psi = source + self.eta * source**3
-        return edge_sum + self._gain(parents) * psi
+        g = np.tanh(parents @ self.weights_g)
+        h = self._gain(parents)
+        return g + h * (source + self.eta * source ** 3)
 
     def metadata(self) -> Dict[str, object]:
         return {
             "name": self.name,
-            "edge_types": list(self.edge_types),
-            "edge_weights": self.edge_weights.tolist(),
-            "gain_weights": self.gain_weights.tolist(),
+            "weights_g": self.weights_g.tolist(),
+            "weights_h": self.weights_h.tolist(),
             "eta": self.eta,
         }
+
+
+# ---------------------------------------------------------------------------
+# Non-additive mechanisms
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TanhCubic(NodeMechanism):
+    """x = tanh((pa @ w_pa + w_s * s)^3) — linear mixing of parents and source, cube, then tanh.
+
+    Invertible: u = pa @ w_pa + w_s * s is linear in s; u^3 is bijective on R;
+    tanh is injective. Given x: u = cbrt(atanh(x)), s = (u - pa @ w_pa) / w_s.
+    w_s is kept strictly positive at construction time.
+    """
+    weights_pa: Array  # (n_parents,)
+    weight_s: float    # strictly positive
+    name: str = "tanh_cubic"
+
+    def __call__(self, parents: Array, source: Array) -> Array:
+        u = parents @ self.weights_pa + self.weight_s * source
+        return np.tanh(u ** 3)
+
+    def metadata(self) -> Dict[str, object]:
+        return {"name": self.name, "weights_pa": self.weights_pa.tolist(), "weight_s": self.weight_s}
+
+
+@dataclass
+class NeuralNetMechanism(NodeMechanism):
+    """Two-layer MLP on (parents, source) — non-additive, invertible in source.
+
+    Invertible: abs(W2) and abs(w_s) are both positive, so each hidden unit
+    contributes a strictly increasing function of s. Their sum is strictly
+    increasing, hence x is a bijection in s for every fixed pa.
+    """
+    W_pa: Array  # (n_hidden, n_parents) — parent weights, unconstrained
+    w_s: Array   # (n_hidden,) — source weights; abs() enforced in forward pass
+    b1: Array    # (n_hidden,)
+    W2: Array    # (n_hidden,) — output weights; abs() enforced in forward pass
+    name: str = "neural_net"
+
+    def __call__(self, parents: Array, source: Array) -> Array:
+        h = np.tanh(parents @ self.W_pa.T + source[:, None] * np.abs(self.w_s) + self.b1)
+        return h @ np.abs(self.W2)
+
+    def metadata(self) -> Dict[str, object]:
+        return {"name": self.name}
+
+
+@dataclass
+class GPMechanism(NodeMechanism):
+    """GP-parameterized location-scale: x = mu(pa) + exp(log_sigma(pa)) * s.
+
+    mu and log_sigma are independent RFF approximations of GP priors over parents.
+    Invertible: exp(log_sigma(pa)) > 0 always, so s = (x - mu(pa)) * exp(-log_sigma(pa)).
+    """
+    omega_mu: Array   # (n_features, n_parents)
+    phase_mu: Array   # (n_features,)
+    alpha_mu: Array   # (n_features,)
+    omega_ls: Array   # (n_features, n_parents)
+    phase_ls: Array   # (n_features,)
+    alpha_ls: Array   # (n_features,)
+    name: str = "gp"
+
+    def _rff(self, parents: Array, omega: Array, phase: Array, alpha: Array) -> Array:
+        n_feat = omega.shape[0]
+        z = np.sqrt(2.0 / n_feat) * np.cos(parents @ omega.T + phase)
+        return z @ alpha
+
+    def __call__(self, parents: Array, source: Array) -> Array:
+        mu = self._rff(parents, self.omega_mu, self.phase_mu, self.alpha_mu)
+        log_sigma = self._rff(parents, self.omega_ls, self.phase_ls, self.alpha_ls)
+        return mu + np.exp(log_sigma) * source
+
+    def metadata(self) -> Dict[str, object]:
+        return {"name": self.name}
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+_ADDITIVE_POOL = ["linear", "anm_tanh", "pnl", "lsnm"]
+_NONADDITIVE_POOL = ["tanh_cubic", "neural_net", "gp"]
 
 
 def build_mechanism(name: Union[str, NodeMechanism], n_parents: int, rng: np.random.Generator) -> NodeMechanism:
@@ -219,39 +198,56 @@ def build_mechanism(name: Union[str, NodeMechanism], n_parents: int, rng: np.ran
         return RootMechanism()
 
     key = str(name).lower()
+
     if key in {"linear", "linear_additive"}:
         return LinearAdditive(weights=rng.uniform(-1.5, 1.5, size=n_parents))
-    if key in {"anm", "anm_tanh", "tanh"}:
-        return TanhAdditive(weights=rng.uniform(-1.5, 1.5, size=n_parents))
-    if key == "sensor_warp":
-        return SensorWarp(
-            weights_linear=rng.uniform(-1.0, 1.0, size=n_parents),
-            weights_nonlinear=rng.uniform(-1.0, 1.0, size=n_parents),
+
+    if key in {"anm", "anm_tanh", "tanh", "nonlinear_additive"}:
+        return NonlinearAdditive(weights=rng.uniform(-1.5, 1.5, size=n_parents))
+
+    if key == "pnl":
+        return PostNonlinear(
+            weights=rng.uniform(-1.5, 1.5, size=n_parents),
             c=float(rng.uniform(-0.7, 0.7)),
         )
-    if key in {"nan_warp", "location_scale", "location_scale_cubic"}:
-        return LocationScaleCubic(
+
+    if key in {"lsnm", "location_scale", "location_scale_cubic"}:
+        return LocationScaleNoise(
             weights_g=rng.uniform(-1.0, 1.0, size=n_parents),
             weights_h=rng.uniform(-1.0, 1.0, size=n_parents),
             eta=float(rng.uniform(0.02, 0.08)),
         )
-    if key == "parent_dependent_warp":
-        return ParentDependentWarp(
-            weights_g=rng.uniform(-1.0, 1.0, size=n_parents),
-            weights_lam=rng.uniform(-1.0, 1.0, size=n_parents),
-            weights_c=rng.uniform(-1.0, 1.0, size=n_parents),
+
+    if key == "tanh_cubic":
+        return TanhCubic(
+            weights_pa=rng.uniform(-1.5, 1.5, size=n_parents),
+            weight_s=float(rng.uniform(0.5, 1.5)),
         )
-    if key == "pnl":
-        return PostNonlinear(weights=rng.uniform(-1.5, 1.5, size=n_parents), c=float(rng.uniform(-0.7, 0.7)))
-    if key in {"mixed", "mixed_edges", "mixed_mechanism"}:
-        edge_library = ["linear", "tanh", "sin", "softsign", "cubic_mild"]
-        edge_types = [str(rng.choice(edge_library)) for _ in range(n_parents)]
-        return MixedEdgeMechanism(
-            edge_types=edge_types,
-            edge_weights=rng.uniform(-1.2, 1.2, size=n_parents),
-            gain_weights=rng.uniform(-1.0, 1.0, size=n_parents),
-            eta=float(rng.uniform(0.01, 0.05)),
+
+    if key in {"nn", "neural_net"}:
+        return NeuralNetMechanism(
+            W_pa=rng.normal(0.0, 1.0 / np.sqrt(n_parents), size=(_N_HIDDEN, n_parents)),
+            w_s=rng.uniform(0.5, 1.5, size=_N_HIDDEN),
+            b1=np.zeros(_N_HIDDEN),
+            # Divide by _N_HIDDEN so sum|W2| ≈ 1, keeping the output O(1) at any depth.
+            W2=rng.uniform(0.5, 1.5, size=_N_HIDDEN) / _N_HIDDEN,
         )
+
+    if key == "gp":
+        return GPMechanism(
+            omega_mu=rng.normal(0.0, 1.0 / _GP_LENGTH_SCALE, size=(_N_RFF, n_parents)),
+            phase_mu=rng.uniform(0.0, 2.0 * np.pi, size=_N_RFF),
+            alpha_mu=rng.normal(0.0, 1.0, size=_N_RFF),
+            omega_ls=rng.normal(0.0, 1.0 / _GP_LENGTH_SCALE, size=(_N_RFF, n_parents)),
+            phase_ls=rng.uniform(0.0, 2.0 * np.pi, size=_N_RFF),
+            alpha_ls=rng.normal(0.0, 0.5, size=_N_RFF),
+        )
+
+    if key in {"mixed", "mixed_mechanism"}:
+        pool = _NONADDITIVE_POOL if rng.random() < 0.5 else _ADDITIVE_POOL
+        chosen = str(rng.choice(pool))
+        return build_mechanism(chosen, n_parents, rng)
+
     raise ValueError(f"Unknown mechanism: {name}")
 
 
