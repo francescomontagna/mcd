@@ -12,6 +12,7 @@ AlgorithmFactory = Callable[[int], object]
 MCD_VARIANTS = {
     "mcd-variance": "variance",
     "mcd-hessian": "hessian",
+    "mcd-hsic": "hsic",
 }
 AVAILABLE_ALGORITHMS = list(MCD_VARIANTS.keys()) + ["random"]
 

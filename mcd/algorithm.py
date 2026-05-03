@@ -7,9 +7,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .graphs import full_dag_from_order
+from .hsic import hsic_test_gamma
 from .stein import SteinMixin, SteinScoreModel, standardize_apply, standardize_fit
 
-SinkRule = Literal["variance", "hessian"]
+SinkRule = Literal["variance", "hessian", "hsic"]
 Aggregate = Literal["sum", "mean"]
 
 
@@ -155,7 +156,7 @@ class MCD:
             X_eval = np.concatenate([train_by_env[e] for e in fit_envs], axis=0)
         else:
             if not 0.0 < self.config.score_train_frac < 1.0:
-                raise ValueError("score_train_frac must be strictly between 0 and 1 for hessian.")
+                raise ValueError("score_train_frac must be strictly between 0 and 1 for hessian/hsic.")
             # score_train_frac sets the TOTAL eval size as a fraction of n;
             # that budget is distributed equally across all k training environments.
             n_eval_per_env = max(1, int(round(self.config.score_train_frac * n / len(fit_envs))))
@@ -206,6 +207,9 @@ class MCD:
         if self.config.sink_rule == "hessian":
             scores = self._hessian_independence_scores(ratio, X_eval)
             return int(np.argmin(scores)), scores
+        if self.config.sink_rule == "hsic":
+            scores = self._hsic_independence_scores(ratio, X_eval)
+            return int(np.argmin(scores)), scores
         raise ValueError(f"Unknown sink_rule: {self.config.sink_rule}")
 
     def _hessian_independence_scores(self, ratio: NDArray, X_eval: NDArray) -> NDArray:
@@ -221,4 +225,14 @@ class MCD:
             block1 = H[:, 0, 1:]
             block2 = H[:, 1:, 0]
             scores[loc] = 0.5 * (np.mean(np.sum(block1**2, axis=1)) + np.mean(np.sum(block2**2, axis=1)))
+        return scores
+
+    def _hsic_independence_scores(self, ratio: NDArray, X_eval: NDArray) -> NDArray:
+        _, d_active = X_eval.shape
+        scores = np.zeros(d_active, dtype=float)
+        for loc in range(d_active):
+            x_minus = np.delete(X_eval, loc, axis=1)
+            r_i = ratio[:, loc]
+            test_stat, _ = hsic_test_gamma(r_i, x_minus)
+            scores[loc] = test_stat
         return scores
