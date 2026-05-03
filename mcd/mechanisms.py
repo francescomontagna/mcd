@@ -63,6 +63,26 @@ class NonlinearAdditive(NodeMechanism):
 
 
 @dataclass
+class NeuralNetANM(NodeMechanism):
+    """x = MLP(pa) + s — two-layer MLP mean function with additive noise.
+
+    f(pa) = W2 @ tanh(W1 @ pa + b1) is bounded but s is unbounded, so x has
+    full Gaussian-like tails. Score estimation is well-conditioned.
+    """
+    W1: Array  # (n_hidden, n_parents)
+    b1: Array  # (n_hidden,)
+    W2: Array  # (n_hidden,)
+    name: str = "anm_nn"
+
+    def __call__(self, parents: Array, source: Array) -> Array:
+        h = np.tanh(parents @ self.W1.T + self.b1)
+        return h @ self.W2 + source
+
+    def metadata(self) -> Dict[str, object]:
+        return {"name": self.name}
+
+
+@dataclass
 class PostNonlinear(NodeMechanism):
     """x = z + c*tanh(z)  where  z = tanh(pa @ w) + s"""
     weights: Array
@@ -112,42 +132,24 @@ class LocationScaleNoise(NodeMechanism):
 
 
 @dataclass
-class TanhCubic(NodeMechanism):
-    """x = tanh((pa @ w_pa + w_s * s)^3) — linear mixing of parents and source, cube, then tanh.
-
-    Invertible: u = pa @ w_pa + w_s * s is linear in s; u^3 is bijective on R;
-    tanh is injective. Given x: u = cbrt(atanh(x)), s = (u - pa @ w_pa) / w_s.
-    w_s is kept strictly positive at construction time.
-    """
-    weights_pa: Array  # (n_parents,)
-    weight_s: float    # strictly positive
-    name: str = "tanh_cubic"
-
-    def __call__(self, parents: Array, source: Array) -> Array:
-        u = parents @ self.weights_pa + self.weight_s * source
-        return np.tanh(u ** 3)
-
-    def metadata(self) -> Dict[str, object]:
-        return {"name": self.name, "weights_pa": self.weights_pa.tolist(), "weight_s": self.weight_s}
-
-
-@dataclass
 class NeuralNetMechanism(NodeMechanism):
-    """Two-layer MLP on (parents, source) — non-additive, invertible in source.
+    """Non-additive two-layer MLP: x = tanh(pa @ W1.T + s * w_s + b1) @ |W2| + c_s * s.
 
-    Invertible: abs(W2) and abs(w_s) are both positive, so each hidden unit
-    contributes a strictly increasing function of s. Their sum is strictly
-    increasing, hence x is a bijection in s for every fixed pa.
+    pa and s are mixed non-additively in the hidden layer. The residual c_s * s
+    ensures unbounded support and strict monotonicity in s:
+        dx/ds = sum_i sech²(pre_i) |w_s_i| |W2_i| + c_s >= c_s > 0.
     """
-    W_pa: Array  # (n_hidden, n_parents) — parent weights, unconstrained
-    w_s: Array   # (n_hidden,) — source weights; abs() enforced in forward pass
-    b1: Array    # (n_hidden,)
-    W2: Array    # (n_hidden,) — output weights; abs() enforced in forward pass
+    W1: Array   # (n_hidden, n_parents)
+    w_s: Array  # (n_hidden,) — abs() enforced in forward pass
+    b1: Array   # (n_hidden,)
+    W2: Array   # (n_hidden,) — abs() enforced in forward pass
+    c_s: float  # strictly positive residual source coupling
     name: str = "neural_net"
 
     def __call__(self, parents: Array, source: Array) -> Array:
-        h = np.tanh(parents @ self.W_pa.T + source[:, None] * np.abs(self.w_s) + self.b1)
-        return h @ np.abs(self.W2)
+        pre = parents @ self.W1.T + source[:, None] * np.abs(self.w_s) + self.b1
+        h = np.tanh(pre)
+        return h @ np.abs(self.W2) + self.c_s * source
 
     def metadata(self) -> Dict[str, object]:
         return {"name": self.name}
@@ -186,8 +188,8 @@ class GPMechanism(NodeMechanism):
 # Factory
 # ---------------------------------------------------------------------------
 
-_ADDITIVE_POOL = ["linear", "anm_tanh", "pnl", "lsnm"]
-_NONADDITIVE_POOL = ["tanh_cubic", "neural_net", "gp"]
+_ADDITIVE_POOL = ["linear", "anm_tanh", "anm_nn", "pnl", "lsnm"]
+_NONADDITIVE_POOL = ["neural_net", "gp"]
 
 
 def build_mechanism(name: Union[str, NodeMechanism], n_parents: int, rng: np.random.Generator) -> NodeMechanism:
@@ -218,19 +220,20 @@ def build_mechanism(name: Union[str, NodeMechanism], n_parents: int, rng: np.ran
             eta=float(rng.uniform(0.02, 0.08)),
         )
 
-    if key == "tanh_cubic":
-        return TanhCubic(
-            weights_pa=rng.uniform(-1.5, 1.5, size=n_parents),
-            weight_s=float(rng.uniform(0.5, 1.5)),
+    if key in {"anm_nn", "neural_net_anm"}:
+        return NeuralNetANM(
+            W1=rng.normal(0.0, 1.0 / np.sqrt(n_parents), size=(_N_HIDDEN, n_parents)),
+            b1=np.zeros(_N_HIDDEN),
+            W2=rng.normal(0.0, 1.0 / np.sqrt(_N_HIDDEN), size=_N_HIDDEN),
         )
 
     if key in {"nn", "neural_net"}:
         return NeuralNetMechanism(
-            W_pa=rng.normal(0.0, 1.0 / np.sqrt(n_parents), size=(_N_HIDDEN, n_parents)),
-            w_s=rng.uniform(0.5, 1.5, size=_N_HIDDEN),
+            W1=rng.normal(0.0, 1.0 / np.sqrt(n_parents), size=(_N_HIDDEN, n_parents)),
+            w_s=rng.uniform(0.3, 0.7, size=_N_HIDDEN),
             b1=np.zeros(_N_HIDDEN),
-            # Divide by _N_HIDDEN so sum|W2| ≈ 1, keeping the output O(1) at any depth.
-            W2=rng.uniform(0.5, 1.5, size=_N_HIDDEN) / _N_HIDDEN,
+            W2=rng.uniform(0.3, 0.7, size=_N_HIDDEN) / _N_HIDDEN,
+            c_s=float(rng.uniform(0.3, 0.7)),
         )
 
     if key == "gp":

@@ -190,6 +190,7 @@ def main() -> None:
                                 "estimated_order": json.dumps([int(x) for x in model.order_]),
                                 "elapsed_s": elapsed_s,
                             }
+
                             rep_rows.append(row)
                             if is_mcd:
                                 print(
@@ -209,11 +210,12 @@ def main() -> None:
                 if row['d'] == d and row['n_samples'] == n_samples
             ]
             if current_rows:
-                dtop_avg = float(np.mean([row['dtop'] for row in current_rows]))
-                print(
-                    f"Average dtop for d={d}, n_samples={n_samples}: "
-                    f"{dtop_avg:.4f} \n ------------ \n"
-                )
+                alg_names = sorted({row['algorithm'] for row in current_rows})
+                print(f"Average dtop for d={d}, n_samples={n_samples}:")
+                for alg in alg_names:
+                    alg_dtops = [row['dtop'] for row in current_rows if row['algorithm'] == alg]
+                    print(f"  {alg}: {float(np.mean(alg_dtops)):.4f}")
+                print(" ------------ \n")
 
         if rows and not args.no_plots:
             plot_dtop_hyperparam_grid(str(csv_path), str(outdir))

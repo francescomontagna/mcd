@@ -113,7 +113,7 @@ def plot_dtop_hyperparam_grid(results_csv: str, outdir: str) -> None:
         ax.set_xlabel("d (number of nodes)")
         ax.set_ylabel("mean Dtop")
         ax.set_title(f"n_samples={n_samples}")
-        ax.set_ylim(bottom=0.0)
+        ax.set_ylim(0.0, 1.0)
         ax.legend(title="algorithm")
         fig.tight_layout()
         fname = f"dtop_n{n_samples}.png"
