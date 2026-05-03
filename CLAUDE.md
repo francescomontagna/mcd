@@ -51,7 +51,7 @@ Current algorithms:
 
 ## Plotting
 
-The plotting function should produce one bar chart per `(n_samples, mcd-variant)` pair. Within each chart the x-axis is the number of nodes; each `d` group shows one bar per hyperparameter combination (currently the swept `krr_reg` values). Bar height is mean `Dtop`; error bar is a 95% confidence interval.
+The plotting function should produce one bar chart per `n_samples`. Within each chart the x-axis is the number of nodes; each `d` group shows one bar per algorithm (all algorithms present in the CSV, averaged over hyperparameter combinations and repetitions). Bar height is mean `Dtop`; error bar is a 95% confidence interval.
 
 ## Before finishing changes
 
