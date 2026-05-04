@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import resource
 import sys
 import time
 from pathlib import Path
@@ -145,7 +146,8 @@ def main() -> None:
                     exp_family_cfg=exp_family_cfg,
                 )
 
-                print(f"d={d}, n_samples={n_samples}, rep={rep}, edges={int(data.adjacency.sum())}")
+                rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                print(f"d={d}, n_samples={n_samples}, rep={rep}, edges={int(data.adjacency.sum())}, peak_rss={rss_mb:.0f}MB")
 
                 rep_rows = []
                 for alg_offset, algorithm_name in enumerate(algorithm_names):

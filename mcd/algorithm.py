@@ -10,7 +10,16 @@ from .graphs import full_dag_from_order
 from .hsic import hsic_test_gamma
 from .stein import SteinMixin, SteinScoreModel, standardize_apply, standardize_fit
 
-SinkRule = Literal["variance", "hessian", "hsic", "projective", "predictive", "pit", "pit-hsic"]
+SinkRule = Literal[
+    "variance",
+    "hessian",
+    "hsic",
+    "contrast-variance",
+    "contrast-hessian",
+    "contrast-hsic",
+    "pit",
+    "pit-hsic",
+]
 Aggregate = Literal["sum", "mean"]
 
 
@@ -20,8 +29,7 @@ class EnvSplit:
 
     env 0 is always the base. All remaining environments are split alternately
     into group1 and group2. eval_env=-1 indicates that the evaluation set is
-    constructed internally (held-out portions of every training env for hessian;
-    pooled training data for variance/predictive).
+    constructed internally from held-out portions of every training environment.
     """
 
     base: int
@@ -36,17 +44,27 @@ class MCDConfig:
 
     Two-stage pipeline:
     1. Fit one Stein/KRR score model per training environment.
-    2. Evaluate all fitted score models on a common X_eval, form score-difference
-       ratios pointwise, and identify sinks.
+    2. Evaluate all fitted score models on a common X_eval.
+    3. Build one of the sink statistics from score-difference contrasts and
+       identify sinks recursively.
 
-    score_train_frac sets the total eval-pool size as a fraction of n when
-    sink_rule is in {"hessian", "hsic", "pit", "pit-hsic", "projective"}:
-    n_eval_total = score_train_frac * n, split equally across all k environments
-    (n_eval_per_env = n_eval_total / k). Each env then uses
-    n - n_eval_per_env samples for score fitting.
+    Current score-ratio family:
+      - variance, hessian, hsic
+        These names now use the bounded projective scalar obtained from the
+        score-difference ratio.
 
-    For sink_rule in {"variance", "predictive"} no split is performed: all
-    samples are used for score fitting and the full pooled data serves as X_eval.
+    True contrast family:
+      - contrast-variance, contrast-hessian, contrast-hsic
+        These use the normalized two-dimensional score-difference contrast
+        (Delta^(1)_i, Delta^(2)_i) directly, without first forming a ratio.
+
+    PIT family:
+      - pit, pit-hsic
+        These use environment-specific conditional CDF residuals.
+
+    All implemented MCD sink rules use a held-out evaluation pool. The total
+    held-out budget is controlled by score_train_frac and split equally across
+    all fitting environments.
     """
 
     sink_rule: SinkRule = "hessian"
@@ -62,12 +80,7 @@ class MCDConfig:
 
 
 def make_env_split(k: int) -> EnvSplit:
-    """Assign environments to base / group1 / group2.
-
-    All k environments participate in score fitting. Environments 1..k-1 are
-    split alternately into group1 and group2. eval_env=-1 because evaluation
-    data is built internally from held-out samples of every training environment.
-    """
+    """Assign environments to base / group1 / group2."""
     if k < 3:
         raise ValueError("MCD needs at least three environments: base + two auxiliary groups.")
     pool = list(range(1, k))
@@ -83,7 +96,7 @@ def _safe_ratio(num: NDArray, den: NDArray, eps: float) -> NDArray:
 
 
 class MCD:
-    """Recursive sink-peeling algorithm from score-difference ratios.
+    """Recursive sink-peeling algorithm from multienvironment score contrasts.
 
     The returned order is source-to-sink. The dense adjacency follows the
     repository convention A[child, parent] = 1. No graph-pruning step is run.
@@ -98,13 +111,11 @@ class MCD:
         X_env = np.asarray(X_env, dtype=float)
         if X_env.ndim != 3:
             raise ValueError("X_env must have shape (k, n, d).")
-        k, n, d = X_env.shape
+        k, _, d = X_env.shape
 
         rng = np.random.default_rng(self.config.random_state)
         split = make_env_split(k)
         self.env_split_ = split
-        self.sink_trace_: List[Dict[str, object]] = []
-        self.score_model_trace_: List[Dict[int, SteinScoreModel]] = []
 
         active = list(range(d))
         sinks: List[int] = []
@@ -112,19 +123,16 @@ class MCD:
             if len(active) == 1:
                 sink = active[0]
                 sinks.append(sink)
-                self.sink_trace_.append({"active": active.copy(), "sink": sink, "scores": {sink: 0.0}})
                 break
 
-            ratio, X_eval_active, score_models, train_by_env = self._fit_scores_and_compute_ratio(X_env, active, split, rng)
-            local_sink, scores = self._identify_sink(ratio, X_eval_active, train_by_env, split)
+            delta1, delta2, X_eval_active, _, train_by_env = self._fit_scores_and_compute_deltas(
+                X_env, active, split, rng
+            )
+            local_sink, scores = self._identify_sink(delta1, delta2, X_eval_active, train_by_env, split)
             sink = active[local_sink]
             if self.config.verbose:
                 print(f"active={active}, sink={sink}, scores={scores}")
 
-            self.score_model_trace_.append(score_models)
-            self.sink_trace_.append(
-                {"active": active.copy(), "sink": sink, "scores": {active[i]: float(scores[i]) for i in range(len(active))}}
-            )
             sinks.append(sink)
             active = [node for node in active if node != sink]
 
@@ -133,44 +141,34 @@ class MCD:
         self.adjacency_ = full_dag_from_order(self.order_)
         return self
 
-    def _fit_scores_and_compute_ratio(
+    def _fit_scores_and_compute_deltas(
         self,
         X_env: NDArray,
         active: List[int],
         split: EnvSplit,
         rng: np.random.Generator,
-    ) -> Tuple[NDArray, NDArray, Dict[int, SteinScoreModel], Dict[int, NDArray]]:
-        """Fit score models on all training envs and evaluate on a common X_eval.
+    ) -> Tuple[NDArray, NDArray, NDArray, Dict[int, SteinScoreModel], Dict[int, NDArray]]:
+        """Fit score models and evaluate two score-difference contrasts.
 
-        variance/predictive: no held-out split; all n samples used for score fitting. X_eval
-          is the concatenation of all training data.
-
-        hessian/hsic/pit/pit-hsic/projective: each env is shuffled and split at
-          n_train=round(score_train_frac*n). Held-out rows from all envs are
-          concatenated into the eval pool, using all available held-out samples
-          (no subsampling).
+        Returns delta1, delta2, X_eval, score_models, train_by_env. The eval set
+        is held out from every fitting environment for every current sink rule.
         """
-        k, n, _ = X_env.shape
+        _, n, _ = X_env.shape
         active_arr = np.asarray(active, dtype=int)
         fit_envs = [split.base] + split.group1 + split.group2
 
-        if self.config.sink_rule in {"variance", "predictive"}:
-            train_by_env = {e: X_env[e][:, active_arr] for e in fit_envs}
-            X_eval = np.concatenate([train_by_env[e] for e in fit_envs], axis=0)
-        else:
-            if not 0.0 < self.config.score_train_frac < 1.0:
-                raise ValueError("score_train_frac must be strictly between 0 and 1 for hessian/hsic/pit/pit-hsic/projective.")
-            # score_train_frac sets the TOTAL eval size as a fraction of n;
-            # that budget is distributed equally across all k training environments.
-            n_eval_per_env = max(1, int(round(self.config.score_train_frac * n / len(fit_envs))))
-            n_train = max(2, n - n_eval_per_env)
-            train_by_env: Dict[int, NDArray] = {}
-            eval_parts: List[NDArray] = []
-            for e in fit_envs:
-                perm = rng.permutation(n)
-                train_by_env[e] = X_env[e][perm[:n_train]][:, active_arr]
-                eval_parts.append(X_env[e][perm[n_train:]][:, active_arr])
-            X_eval = np.concatenate(eval_parts, axis=0)
+        if not 0.0 < self.config.score_train_frac < 1.0:
+            raise ValueError("score_train_frac must be strictly between 0 and 1.")
+
+        n_eval_per_env = max(1, int(round(self.config.score_train_frac * n / len(fit_envs))))
+        n_train = max(2, n - n_eval_per_env)
+        train_by_env: Dict[int, NDArray] = {}
+        eval_parts: List[NDArray] = []
+        for e in fit_envs:
+            perm = rng.permutation(n)
+            train_by_env[e] = X_env[e][perm[:n_train]][:, active_arr]
+            eval_parts.append(X_env[e][perm[n_train:]][:, active_arr])
+        X_eval = np.concatenate(eval_parts, axis=0)
 
         if self.config.standardize:
             pooled = np.concatenate(list(train_by_env.values()) + [X_eval], axis=0)
@@ -199,35 +197,26 @@ class MCD:
 
         delta1 = score_by_env[split.base] - aggregate(split.group1)
         delta2 = score_by_env[split.base] - aggregate(split.group2)
-        ratio = _safe_ratio(delta1, delta2, self.config.denominator_eps)
-        ratio = np.clip(ratio, -1e6, 1e6)
+        delta1 = np.clip(delta1, -1e6, 1e6)
+        delta2 = np.clip(delta2, -1e6, 1e6)
+
         train_by_env_used = train_by_env
         if self.config.standardize:
             train_by_env_used = {e: standardize_apply(train_by_env[e], mean, std) for e in fit_envs}
-        return ratio, X_eval_used, score_models, train_by_env_used
+        return delta1, delta2, X_eval_used, score_models, train_by_env_used
 
     def _identify_sink(
         self,
-        ratio: NDArray,
+        delta1: NDArray,
+        delta2: NDArray,
         X_eval: NDArray,
         train_by_env: Optional[Dict[int, NDArray]] = None,
         split: Optional[EnvSplit] = None,
     ) -> Tuple[int, NDArray]:
-        if self.config.sink_rule == "variance":
-            scores = np.var(ratio, axis=0)
-            return int(np.argmin(scores)), scores
-        if self.config.sink_rule == "projective":
-            scores = np.var(self._projective_coordinate(ratio), axis=0)
-            return int(np.argmin(scores)), scores
-        if self.config.sink_rule == "predictive":
-            scores = self._predictability_scores(self._projective_coordinate(ratio), X_eval)
-            return int(np.argmin(scores)), scores
-        if self.config.sink_rule == "hessian":
-            scores = self._hessian_independence_scores(ratio, X_eval)
-            return int(np.argmin(scores)), scores
-        if self.config.sink_rule == "hsic":
-            scores = self._hsic_independence_scores(ratio, X_eval)
-            return int(np.argmin(scores)), scores
+        if self.config.sink_rule in {"variance", "hessian", "hsic"}:
+            return self._identify_sink_from_projective_ratio(delta1, delta2, X_eval)
+        if self.config.sink_rule in {"contrast-variance", "contrast-hessian", "contrast-hsic"}:
+            return self._identify_sink_from_contrast(delta1, delta2, X_eval)
         if self.config.sink_rule == "pit":
             if train_by_env is None or split is None:
                 raise ValueError("PIT sink identification requires per-environment training data and an environment split.")
@@ -240,21 +229,58 @@ class MCD:
             return int(np.argmin(scores)), scores
         raise ValueError(f"Unknown sink_rule: {self.config.sink_rule}")
 
-    def _projective_coordinate(self, ratio: NDArray) -> NDArray:
+    def _identify_sink_from_projective_ratio(
+        self,
+        delta1: NDArray,
+        delta2: NDArray,
+        X_eval: NDArray,
+    ) -> Tuple[int, NDArray]:
+        ratio = _safe_ratio(delta1, delta2, self.config.denominator_eps)
+        ratio = np.clip(ratio, -1e6, 1e6)
+        target = self._projective_ratio_coordinate(ratio)
+        if self.config.sink_rule == "variance":
+            scores = np.var(target, axis=0)
+        elif self.config.sink_rule == "hessian":
+            scores = self._hessian_independence_scores_by_node(target, X_eval)
+        elif self.config.sink_rule == "hsic":
+            scores = self._hsic_independence_scores_by_node(target, X_eval)
+        else:
+            raise ValueError(f"Unexpected projective-ratio sink rule: {self.config.sink_rule}")
+        return int(np.argmin(scores)), scores
+
+    def _identify_sink_from_contrast(
+        self,
+        delta1: NDArray,
+        delta2: NDArray,
+        X_eval: NDArray,
+    ) -> Tuple[int, NDArray]:
+        targets = self._projective_contrast_targets(delta1, delta2)
+        if self.config.sink_rule == "contrast-variance":
+            scores = np.asarray([float(np.trace(np.cov(target, rowvar=False))) for target in targets])
+        elif self.config.sink_rule == "contrast-hessian":
+            scores = self._hessian_independence_scores_by_node(targets, X_eval)
+        elif self.config.sink_rule == "contrast-hsic":
+            scores = self._hsic_independence_scores_by_node(targets, X_eval)
+        else:
+            raise ValueError(f"Unexpected contrast sink rule: {self.config.sink_rule}")
+        return int(np.argmin(scores)), scores
+
+    def _projective_ratio_coordinate(self, ratio: NDArray) -> NDArray:
         ratio = np.asarray(ratio, dtype=float)
         return ratio / np.sqrt(1.0 + ratio**2)
 
-    def _predictability_scores(self, target: NDArray, X_eval: NDArray) -> NDArray:
-        n, d_active = X_eval.shape
-        scores = np.zeros(d_active, dtype=float)
-        rng = np.random.default_rng(self.config.random_state)
-        perm = rng.permutation(n)
-        folds = np.array_split(perm, 2)
-        for loc in range(d_active):
-            x_minus = np.delete(X_eval, loc, axis=1)
-            y = target[:, loc:loc+1]
-            scores[loc] = self._crossfit_ridge_score(x_minus, y, folds)
-        return scores
+    def _projective_contrast_targets(self, delta1: NDArray, delta2: NDArray) -> List[NDArray]:
+        """Return one sign-invariant projective contrast target per active node.
+
+        For each node i, the raw two-vector is v_i=(Delta_i^(1), Delta_i^(2)).
+        We represent its projective direction by the rank-one projector
+        v_i v_i^T / ||v_i||^2, flattened as (u_1^2, u_1 u_2, u_2^2). This avoids
+        dividing by one coordinate and is invariant to v_i -> -v_i.
+        """
+        denom = np.sqrt(delta1**2 + delta2**2 + self.config.denominator_eps**2)
+        u1 = delta1 / denom
+        u2 = delta2 / denom
+        return [np.column_stack([u1[:, loc] ** 2, u1[:, loc] * u2[:, loc], u2[:, loc] ** 2]) for loc in range(delta1.shape[1])]
 
     def _pit_predictability_scores(
         self,
@@ -335,16 +361,14 @@ class MCD:
         self,
         X: NDArray,
         Y: NDArray,
-        folds: Optional[List[NDArray]] = None,
     ) -> float:
         X = np.asarray(X, dtype=float)
         Y = np.asarray(Y, dtype=float)
         if Y.ndim == 1:
             Y = Y[:, None]
         n = X.shape[0]
-        if folds is None:
-            rng = np.random.default_rng(self.config.random_state)
-            folds = np.array_split(rng.permutation(n), 2)
+        rng = np.random.default_rng(self.config.random_state)
+        folds = np.array_split(rng.permutation(n), 2)
         sse = 0.0
         sst = 0.0
         p = X.shape[1]
@@ -375,27 +399,33 @@ class MCD:
         U = np.clip(U, eps, 1.0 - eps)
         return np.log(U / (1.0 - U))
 
-    def _hessian_independence_scores(self, ratio: NDArray, X_eval: NDArray) -> NDArray:
+    def _hessian_independence_scores_by_node(self, targets: NDArray | List[NDArray], X_eval: NDArray) -> NDArray:
         _, d_active = X_eval.shape
         mixin = SteinMixin()
         scores = np.zeros(d_active, dtype=float)
         for loc in range(d_active):
+            target = targets[:, loc:loc + 1] if isinstance(targets, np.ndarray) else targets[loc]
+            if target.ndim == 1:
+                target = target[:, None]
             x_minus = np.delete(X_eval, loc, axis=1)
-            z = np.column_stack([ratio[:, loc], x_minus])
+            z = np.column_stack([target, x_minus])
             mean, std = standardize_fit(z)
             z = standardize_apply(z, mean, std)
             H = mixin.hessian(z, eta_G=self.config.eta_G, eta_H=self.config.eta_H)
-            block1 = H[:, 0, 1:]
-            block2 = H[:, 1:, 0]
-            scores[loc] = 0.5 * (np.mean(np.sum(block1**2, axis=1)) + np.mean(np.sum(block2**2, axis=1)))
+            target_dim = target.shape[1]
+            block1 = H[:, :target_dim, target_dim:]
+            block2 = H[:, target_dim:, :target_dim]
+            scores[loc] = 0.5 * (np.mean(np.sum(block1**2, axis=(1, 2))) + np.mean(np.sum(block2**2, axis=(1, 2))))
         return scores
 
-    def _hsic_independence_scores(self, ratio: NDArray, X_eval: NDArray) -> NDArray:
+    def _hsic_independence_scores_by_node(self, targets: NDArray | List[NDArray], X_eval: NDArray) -> NDArray:
         _, d_active = X_eval.shape
         scores = np.zeros(d_active, dtype=float)
         for loc in range(d_active):
+            target = targets[:, loc:loc + 1] if isinstance(targets, np.ndarray) else targets[loc]
+            if target.ndim == 1:
+                target = target[:, None]
             x_minus = np.delete(X_eval, loc, axis=1)
-            r_i = ratio[:, loc]
-            test_stat, _ = hsic_test_gamma(r_i, x_minus)
+            test_stat, _ = hsic_test_gamma(target, x_minus)
             scores[loc] = test_stat
         return scores

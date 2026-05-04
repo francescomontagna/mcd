@@ -1,3 +1,6 @@
 numpy>=1.23
 matplotlib>=3.6
 pytest>=7.0
+scipy
+statsmodels
+tqdm

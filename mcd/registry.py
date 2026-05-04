@@ -7,14 +7,16 @@ from .baselines import RandomOrderBaseline, RandomOrderConfig
 
 AlgorithmFactory = Callable[[int], object]
 
-# Algorithm names exposed via the registry. mcd-variance and mcd-hessian both
-# instantiate MCD; only the sink_rule differs.
+# Algorithm names exposed via the registry. The plain variance/hessian/hsic
+# names now denote the bounded projective-ratio variants. The contrast-* names
+# denote the true two-vector score-contrast variants.
 MCD_VARIANTS = {
     "mcd-variance": "variance",
     "mcd-hessian": "hessian",
     "mcd-hsic": "hsic",
-    "mcd-projective": "projective",
-    "mcd-predictive": "predictive",
+    "mcd-contrast-variance": "contrast-variance",
+    "mcd-contrast-hessian": "contrast-hessian",
+    "mcd-contrast-hsic": "contrast-hsic",
     "mcd-pit": "pit",
     "mcd-pit-hsic": "pit-hsic",
 }
