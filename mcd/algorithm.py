@@ -10,7 +10,7 @@ from .graphs import full_dag_from_order
 from .hsic import hsic_test_gamma
 from .stein import SteinMixin, SteinScoreModel, standardize_apply, standardize_fit
 
-SinkRule = Literal["variance", "hessian", "hsic", "projective", "predictive", "pit"]
+SinkRule = Literal["variance", "hessian", "hsic", "projective", "predictive", "pit", "pit-hsic"]
 Aggregate = Literal["sum", "mean"]
 
 
@@ -21,7 +21,7 @@ class EnvSplit:
     env 0 is always the base. All remaining environments are split alternately
     into group1 and group2. eval_env=-1 indicates that the evaluation set is
     constructed internally (held-out portions of every training env for hessian;
-    pooled training data for variance).
+    pooled training data for variance/predictive).
     """
 
     base: int
@@ -40,11 +40,13 @@ class MCDConfig:
        ratios pointwise, and identify sinks.
 
     score_train_frac sets the total eval-pool size as a fraction of n when
-    sink_rule="hessian": n_eval_total = score_train_frac * n, split equally
-    across all k environments (n_eval_per_env = n_eval_total / k). Each env
-    then uses n - n_eval_per_env samples for score fitting.
-    For sink_rule="variance" no split is performed: all samples are used for
-    score fitting and the full pooled data serves as X_eval.
+    sink_rule is in {"hessian", "hsic", "pit", "pit-hsic", "projective"}:
+    n_eval_total = score_train_frac * n, split equally across all k environments
+    (n_eval_per_env = n_eval_total / k). Each env then uses
+    n - n_eval_per_env samples for score fitting.
+
+    For sink_rule in {"variance", "predictive"} no split is performed: all
+    samples are used for score fitting and the full pooled data serves as X_eval.
     """
 
     sink_rule: SinkRule = "hessian"
@@ -140,22 +142,24 @@ class MCD:
     ) -> Tuple[NDArray, NDArray, Dict[int, SteinScoreModel], Dict[int, NDArray]]:
         """Fit score models on all training envs and evaluate on a common X_eval.
 
-        variance/projective/predictive: no held-out split; all n samples used for score fitting. X_eval
+        variance/predictive: no held-out split; all n samples used for score fitting. X_eval
           is the concatenation of all training data.
-        hessian/hsic/pit: each env is shuffled and split at n_train=round(score_train_frac*n).
-          Held-out rows from all envs are concatenated into the eval pool, using
-          all available held-out samples (no subsampling).
+
+        hessian/hsic/pit/pit-hsic/projective: each env is shuffled and split at
+          n_train=round(score_train_frac*n). Held-out rows from all envs are
+          concatenated into the eval pool, using all available held-out samples
+          (no subsampling).
         """
         k, n, _ = X_env.shape
         active_arr = np.asarray(active, dtype=int)
         fit_envs = [split.base] + split.group1 + split.group2
 
-        if self.config.sink_rule in {"variance", "projective", "predictive"}:
+        if self.config.sink_rule in {"variance", "predictive"}:
             train_by_env = {e: X_env[e][:, active_arr] for e in fit_envs}
             X_eval = np.concatenate([train_by_env[e] for e in fit_envs], axis=0)
         else:
             if not 0.0 < self.config.score_train_frac < 1.0:
-                raise ValueError("score_train_frac must be strictly between 0 and 1 for hessian/hsic/pit.")
+                raise ValueError("score_train_frac must be strictly between 0 and 1 for hessian/hsic/pit/pit-hsic/projective.")
             # score_train_frac sets the TOTAL eval size as a fraction of n;
             # that budget is distributed equally across all k training environments.
             n_eval_per_env = max(1, int(round(self.config.score_train_frac * n / len(fit_envs))))
@@ -229,6 +233,11 @@ class MCD:
                 raise ValueError("PIT sink identification requires per-environment training data and an environment split.")
             scores = self._pit_predictability_scores(X_eval, train_by_env, split)
             return int(np.argmin(scores)), scores
+        if self.config.sink_rule == "pit-hsic":
+            if train_by_env is None or split is None:
+                raise ValueError("PIT-HSIC sink identification requires per-environment training data and an environment split.")
+            scores = self._pit_hsic_scores(X_eval, train_by_env, split)
+            return int(np.argmin(scores)), scores
         raise ValueError(f"Unknown sink_rule: {self.config.sink_rule}")
 
     def _projective_coordinate(self, ratio: NDArray) -> NDArray:
@@ -257,13 +266,38 @@ class MCD:
         scores = np.zeros(d_active, dtype=float)
         for loc in range(d_active):
             features_eval = np.delete(X_eval, loc, axis=1)
-            y_eval = X_eval[:, loc]
-            pit_base = self._conditional_pit(train_by_env[split.base], features_eval, y_eval, loc)[:, None]
-            pit_g1 = self._aggregate_group_pit(train_by_env, split.group1, features_eval, y_eval, loc)[:, None]
-            pit_g2 = self._aggregate_group_pit(train_by_env, split.group2, features_eval, y_eval, loc)[:, None]
-            target = self._logit_clip(np.concatenate([pit_base, pit_g1, pit_g2], axis=1))
+            target = self._pit_target(X_eval, train_by_env, split, loc)
             scores[loc] = self._crossfit_ridge_score(features_eval, target)
         return scores
+
+    def _pit_hsic_scores(
+        self,
+        X_eval: NDArray,
+        train_by_env: Dict[int, NDArray],
+        split: EnvSplit,
+    ) -> NDArray:
+        _, d_active = X_eval.shape
+        scores = np.zeros(d_active, dtype=float)
+        for loc in range(d_active):
+            features_eval = np.delete(X_eval, loc, axis=1)
+            target = self._pit_target(X_eval, train_by_env, split, loc)
+            test_stat, _ = hsic_test_gamma(target, features_eval)
+            scores[loc] = test_stat
+        return scores
+
+    def _pit_target(
+        self,
+        X_eval: NDArray,
+        train_by_env: Dict[int, NDArray],
+        split: EnvSplit,
+        loc: int,
+    ) -> NDArray:
+        features_eval = np.delete(X_eval, loc, axis=1)
+        y_eval = X_eval[:, loc]
+        pit_base = self._conditional_pit(train_by_env[split.base], features_eval, y_eval, loc)[:, None]
+        pit_g1 = self._aggregate_group_pit(train_by_env, split.group1, features_eval, y_eval, loc)[:, None]
+        pit_g2 = self._aggregate_group_pit(train_by_env, split.group2, features_eval, y_eval, loc)[:, None]
+        return self._logit_clip(np.concatenate([pit_base, pit_g1, pit_g2], axis=1))
 
     def _aggregate_group_pit(
         self,

@@ -16,6 +16,7 @@ MCD_VARIANTS = {
     "mcd-projective": "projective",
     "mcd-predictive": "predictive",
     "mcd-pit": "pit",
+    "mcd-pit-hsic": "pit-hsic",
 }
 AVAILABLE_ALGORITHMS = list(MCD_VARIANTS.keys()) + ["random"]
 
