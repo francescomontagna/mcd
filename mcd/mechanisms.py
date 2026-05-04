@@ -190,6 +190,8 @@ class GPMechanism(NodeMechanism):
 
 _ADDITIVE_POOL = ["linear", "anm_tanh", "anm_nn", "pnl", "lsnm"]
 _NONADDITIVE_POOL = ["neural_net", "gp"]
+_NOT_OBS_ID_POOL = ["linear", "neural_net", "gp"]
+_OBS_ID_POOL = ["anm_tanh", "anm_nn", "pnl", "lsnm"]
 
 
 def build_mechanism(name: Union[str, NodeMechanism], n_parents: int, rng: np.random.Generator) -> NodeMechanism:
@@ -249,6 +251,14 @@ def build_mechanism(name: Union[str, NodeMechanism], n_parents: int, rng: np.ran
     if key in {"mixed", "mixed_mechanism"}:
         pool = _NONADDITIVE_POOL if rng.random() < 0.5 else _ADDITIVE_POOL
         chosen = str(rng.choice(pool))
+        return build_mechanism(chosen, n_parents, rng)
+
+    if key in {"not_obs_id", "non_obs_id"}:
+        chosen = str(rng.choice(_NOT_OBS_ID_POOL))
+        return build_mechanism(chosen, n_parents, rng)
+
+    if key == "obs_id":
+        chosen = str(rng.choice(_OBS_ID_POOL))
         return build_mechanism(chosen, n_parents, rng)
 
     raise ValueError(f"Unknown mechanism: {name}")

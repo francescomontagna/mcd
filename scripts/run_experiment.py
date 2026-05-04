@@ -67,7 +67,9 @@ def main() -> None:
                              "tanh_cubic (non-additive tanh+cubic), "
                              "nn/neural_net (non-additive neural network), "
                              "gp (non-additive Gaussian process), "
-                             "mixed (randomly samples from all of the above per node).")
+                             "mixed (randomly samples from all of the above per node), "
+                             "not_obs_id (uniform over linear/nn/gp — not observationally identifiable), "
+                             "obs_id (uniform over anm_tanh/anm_nn/pnl/lsnm — observationally identifiable).")
     parser.add_argument("--algorithms", type=str, default="mcd-variance,mcd-hessian",
                         help=f"Comma-separated list, choose from: {','.join(MCD_VARIANTS.keys())},random.")
 
@@ -92,7 +94,7 @@ def main() -> None:
     parser.add_argument("--no-plots", action="store_true")
     args = parser.parse_args()
 
-    outdir = Path(args.outdir)
+    outdir = Path(args.outdir, args.mechanism)
     outdir.mkdir(parents=True, exist_ok=True)
 
     log_file = open(outdir / "logs.txt", "w")
@@ -218,12 +220,9 @@ def main() -> None:
                 print(" ------------ \n")
 
         if rows and not args.no_plots:
-            plot_dtop_hyperparam_grid(str(csv_path), str(outdir))
+            plot_dtop_hyperparam_grid(str(csv_path), str(outdir), n_samples_filter=n_samples)
 
     pbar.close()
-
-    if rows and not args.no_plots:
-        plot_dtop_hyperparam_grid(str(csv_path), str(outdir))
     print(f"Saved metrics to {csv_path}")
 
     sys.stdout = sys.__stdout__

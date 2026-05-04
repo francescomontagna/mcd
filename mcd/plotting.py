@@ -55,8 +55,10 @@ def plot_dtop_bars(results_csv: str, outdir: str) -> None:
     plt.close(fig)
 
 
-def plot_dtop_hyperparam_grid(results_csv: str, outdir: str) -> None:
-    """One bar chart per n_samples.
+def plot_dtop_hyperparam_grid(
+    results_csv: str, outdir: str, n_samples_filter: int | None = None
+) -> None:
+    """One bar chart per n_samples (or just one chart if n_samples_filter is set).
 
     x-axis is the number of nodes d; within each d there is one bar per
     algorithm. Bar height is mean Dtop across all reps and hyperparameter
@@ -78,6 +80,8 @@ def plot_dtop_hyperparam_grid(results_csv: str, outdir: str) -> None:
 
     for row in rows:
         n_samples = int(row["n_samples"])
+        if n_samples_filter is not None and n_samples != n_samples_filter:
+            continue
         d = int(row["d"])
         algorithm = row["algorithm"]
         grouped[(n_samples, algorithm, d)].append(float(row["dtop"]))

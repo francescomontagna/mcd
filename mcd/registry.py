@@ -13,6 +13,9 @@ MCD_VARIANTS = {
     "mcd-variance": "variance",
     "mcd-hessian": "hessian",
     "mcd-hsic": "hsic",
+    "mcd-projective": "projective",
+    "mcd-predictive": "predictive",
+    "mcd-pit": "pit",
 }
 AVAILABLE_ALGORITHMS = list(MCD_VARIANTS.keys()) + ["random"]
 
@@ -63,7 +66,3 @@ def make_algorithm_factory(
 
 def make_algorithm_factories(names: Iterable[str], **kwargs) -> Dict[str, AlgorithmFactory]:
     return {name: make_algorithm_factory(name, **kwargs) for name in names}
-
-
- 
-                              
