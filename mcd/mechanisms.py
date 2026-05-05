@@ -208,7 +208,7 @@ class GPMechanism(NodeMechanism):
 
     def __call__(self, parents: Array, source: Array) -> Array:
         z = np.concatenate([parents, source[:, None]], axis=1)
-        return self._rff(z) + self.c_s * source
+        return self._rff(z)
 
     def metadata(self) -> Dict[str, object]:
         return {"name": self.name}
