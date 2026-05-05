@@ -14,9 +14,6 @@ SinkRule = Literal[
     "variance",
     "hessian",
     "hsic",
-    "pit",
-    "pit-hsic",
-    "pit-hessian",
 ]
 Aggregate = Literal["sum", "mean"]
 
@@ -46,15 +43,9 @@ class MCDConfig:
     3. Build one of the sink statistics from score-difference contrasts and
        identify sinks recursively.
 
-    Normalized-direction family:
-      - variance, hessian, hsic
-        For each node i and sample x, form U_i(x) = (Delta_i^(1)(x), Delta_i^(2)(x))
-        normalized to the unit circle. The sink statistic is applied to this
-        2-vector target; no ratio is formed.
-
-    PIT family:
-      - pit, pit-hsic
-        These use environment-specific conditional CDF residuals.
+    For each node i and sample x, form U_i(x) = (Delta_i^(1)(x), Delta_i^(2)(x))
+    normalized to the unit circle. The sink statistic is applied to this
+    2-vector target; no ratio is formed.
 
     All implemented MCD sink rules use a held-out evaluation pool. The total
     held-out budget is controlled by score_train_frac and split equally across
@@ -210,24 +201,7 @@ class MCD:
         split: Optional[EnvSplit] = None,
         rng: Optional[np.random.Generator] = None,
     ) -> Tuple[int, NDArray]:
-        if self.config.sink_rule in {"variance", "hessian", "hsic"}:
-            return self._identify_sink_from_direction(delta1, delta2, X_eval)
-        if self.config.sink_rule == "pit":
-            if train_by_env is None or split is None:
-                raise ValueError("PIT sink identification requires per-environment training data and an environment split.")
-            scores = self._pit_predictability_scores(X_eval, train_by_env, split, rng=rng)
-            return int(np.argmin(scores)), scores
-        if self.config.sink_rule == "pit-hsic":
-            if train_by_env is None or split is None:
-                raise ValueError("PIT-HSIC sink identification requires per-environment training data and an environment split.")
-            scores = self._pit_hsic_scores(X_eval, train_by_env, split)
-            return int(np.argmin(scores)), scores
-        if self.config.sink_rule == "pit-hessian":
-            if train_by_env is None or split is None:
-                raise ValueError("PIT-hessian sink identification requires per-environment training data and an environment split.")
-            scores = self._pit_hessian_scores(X_eval, train_by_env, split)
-            return int(np.argmin(scores)), scores
-        raise ValueError(f"Unknown sink_rule: {self.config.sink_rule}")
+        return self._identify_sink_from_direction(delta1, delta2, X_eval)
 
 
     def _identify_sink_from_direction(
@@ -257,150 +231,6 @@ class MCD:
         u2 = delta2 / denom
         d_active = delta1.shape[1]
         return [np.column_stack([u1[:, i], u2[:, i]]) for i in range(d_active)]
-
-    def _pit_predictability_scores(
-        self,
-        X_eval: NDArray,
-        train_by_env: Dict[int, NDArray],
-        split: EnvSplit,
-        rng: Optional[np.random.Generator] = None,
-    ) -> NDArray:
-        if rng is None:
-            rng = np.random.default_rng(self.config.random_state)
-        _, d_active = X_eval.shape
-        scores = np.zeros(d_active, dtype=float)
-        for loc in range(d_active):
-            features_eval = np.delete(X_eval, loc, axis=1)
-            target = self._pit_target(X_eval, train_by_env, split, loc)
-            scores[loc] = self._crossfit_ridge_score(features_eval, target, rng=rng)
-        return scores
-
-    def _pit_hsic_scores(
-        self,
-        X_eval: NDArray,
-        train_by_env: Dict[int, NDArray],
-        split: EnvSplit,
-    ) -> NDArray:
-        _, d_active = X_eval.shape
-        scores = np.zeros(d_active, dtype=float)
-        for loc in range(d_active):
-            features_eval = np.delete(X_eval, loc, axis=1)
-            target = self._pit_target(X_eval, train_by_env, split, loc)
-            test_stat, _ = hsic_test_gamma(target, features_eval)
-            scores[loc] = test_stat
-        return scores
-
-    def _pit_hessian_scores(
-        self,
-        X_eval: NDArray,
-        train_by_env: Dict[int, NDArray],
-        split: EnvSplit,
-    ) -> NDArray:
-        _, d_active = X_eval.shape
-        scores = np.zeros(d_active, dtype=float)
-        mixin = SteinMixin()
-        for loc in range(d_active):
-            features_eval = np.delete(X_eval, loc, axis=1)
-            target = self._pit_target(X_eval, train_by_env, split, loc)
-            z = np.column_stack([target, features_eval])
-            mean, std = standardize_fit(z)
-            z = standardize_apply(z, mean, std)
-            H = mixin.hessian(z, eta_G=self.config.eta_G, eta_H=self.config.eta_H)
-            target_dim = target.shape[1]
-            block1 = H[:, :target_dim, target_dim:]
-            block2 = H[:, target_dim:, :target_dim]
-            scores[loc] = 0.5 * (np.mean(np.sum(block1**2, axis=(1, 2))) + np.mean(np.sum(block2**2, axis=(1, 2))))
-        return scores
-
-    def _pit_target(
-        self,
-        X_eval: NDArray,
-        train_by_env: Dict[int, NDArray],
-        split: EnvSplit,
-        loc: int,
-    ) -> NDArray:
-        features_eval = np.delete(X_eval, loc, axis=1)
-        y_eval = X_eval[:, loc]
-        pit_base = self._conditional_pit(train_by_env[split.base], features_eval, y_eval, loc)[:, None]
-        pit_g1 = self._aggregate_group_pit(train_by_env, split.group1, features_eval, y_eval, loc)[:, None]
-        pit_g2 = self._aggregate_group_pit(train_by_env, split.group2, features_eval, y_eval, loc)[:, None]
-        return self._logit_clip(np.concatenate([pit_base, pit_g1, pit_g2], axis=1))
-
-    def _aggregate_group_pit(
-        self,
-        train_by_env: Dict[int, NDArray],
-        group: List[int],
-        features_eval: NDArray,
-        y_eval: NDArray,
-        loc: int,
-    ) -> NDArray:
-        values = [self._conditional_pit(train_by_env[e], features_eval, y_eval, loc) for e in group]
-        return np.mean(np.stack(values, axis=0), axis=0)
-
-    def _conditional_pit(
-        self,
-        X_train: NDArray,
-        features_eval: NDArray,
-        y_eval: NDArray,
-        loc: int,
-    ) -> NDArray:
-        y_train = X_train[:, loc]
-        x_minus_train = np.delete(X_train, loc, axis=1)
-        if x_minus_train.shape[1] == 0:
-            return (y_train[None, :] <= y_eval[:, None]).mean(axis=1)
-        widths = np.sqrt(np.maximum(np.sum((x_minus_train[:, None, :] - x_minus_train[None, :, :]) ** 2, axis=2), 0.0))
-        vals = widths[np.triu_indices_from(widths, k=1)]
-        vals = vals[np.isfinite(vals) & (vals > 1e-12)]
-        width = float(np.median(vals)) if vals.size else 1.0
-        d2 = np.maximum(np.sum((features_eval[:, None, :] - x_minus_train[None, :, :]) ** 2, axis=2), 0.0)
-        K = np.exp(-d2 / (2.0 * width**2))
-        weights = K / np.maximum(K.sum(axis=1, keepdims=True), 1e-12)
-        indicators = (y_train[None, :] <= y_eval[:, None]).astype(float)
-        return np.sum(weights * indicators, axis=1)
-
-    def _crossfit_ridge_score(
-        self,
-        X: NDArray,
-        Y: NDArray,
-        rng: Optional[np.random.Generator] = None,
-    ) -> float:
-        X = np.asarray(X, dtype=float)
-        Y = np.asarray(Y, dtype=float)
-        if Y.ndim == 1:
-            Y = Y[:, None]
-        n = X.shape[0]
-        if rng is None:
-            rng = np.random.default_rng(self.config.random_state)
-        folds = np.array_split(rng.permutation(n), 2)
-        sse = 0.0
-        sst = 0.0
-        p = X.shape[1]
-        eye = np.eye(p)
-        for fold in folds:
-            train = np.setdiff1d(np.arange(n), fold, assume_unique=False)
-            if train.size == 0 or fold.size == 0:
-                continue
-            Xtr = X[train]
-            Xva = X[fold]
-            Ytr = Y[train]
-            Yva = Y[fold]
-            x_mean = Xtr.mean(axis=0, keepdims=True)
-            x_std = Xtr.std(axis=0, keepdims=True)
-            x_std = np.where(x_std < 1e-8, 1.0, x_std)
-            Xtrn = (Xtr - x_mean) / x_std
-            Xvan = (Xva - x_mean) / x_std
-            y_mean = Ytr.mean(axis=0, keepdims=True)
-            Ytrc = Ytr - y_mean
-            beta = np.linalg.solve(Xtrn.T @ Xtrn + self.config.krr_reg * eye, Xtrn.T @ Ytrc) if p > 0 else np.zeros((0, Y.shape[1]))
-            pred = (Xvan @ beta if p > 0 else np.zeros_like(Yva)) + y_mean
-            sse += float(np.sum((Yva - pred) ** 2))
-            centered = Yva - y_mean
-            sst += float(np.sum(centered ** 2))
-        return 1.0 - sse / max(sst, 1e-12)
-
-    def _logit_clip(self, U: NDArray, eps: float = 1e-4) -> NDArray:
-        U = np.clip(U, eps, 1.0 - eps)
-        return np.log(U / (1.0 - U))
 
     def _hessian_independence_scores_by_node(self, targets: List[NDArray], X_eval: NDArray) -> NDArray:
         _, d_active = X_eval.shape

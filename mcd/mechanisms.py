@@ -7,9 +7,10 @@ import numpy as np
 
 Array = np.ndarray
 
-_N_HIDDEN = 16
+_N_HIDDEN = 32
+_N_DEPTH = 8
 _N_RFF = 32
-_GP_LENGTH_SCALE = 1.0
+_GP_LENGTH_SCALE = 2.0
 
 
 class NodeMechanism:
@@ -51,12 +52,12 @@ class LinearAdditive(NodeMechanism):
 
 @dataclass
 class NonlinearAdditive(NodeMechanism):
-    """x = tanh(pa @ w) + s"""
+    """x = sin(pa @ w) + s"""
     weights: Array
     name: str = "anm_tanh"
 
     def __call__(self, parents: Array, source: Array) -> Array:
-        return np.tanh(parents @ self.weights) + source
+        return np.sin(parents @ self.weights) + source
 
     def metadata(self) -> Dict[str, object]:
         return {"name": self.name, "weights": self.weights.tolist()}
@@ -64,19 +65,25 @@ class NonlinearAdditive(NodeMechanism):
 
 @dataclass
 class NeuralNetANM(NodeMechanism):
-    """x = MLP(pa) + s — two-layer MLP mean function with additive noise.
+    """x = deep_MLP(pa) + s — _N_DEPTH-layer MLP with LayerNorm before output.
 
-    f(pa) = W2 @ tanh(W1 @ pa + b1) is bounded but s is unbounded, so x has
-    full Gaussian-like tails. Score estimation is well-conditioned.
+    Architecture: (_N_DEPTH-1) tanh hidden layers, then LayerNorm, then linear output.
     """
-    W1: Array  # (n_hidden, n_parents)
-    b1: Array  # (n_hidden,)
-    W2: Array  # (n_hidden,)
+    hidden_weights: List[Array]  # len = _N_DEPTH-1; shapes (n_hidden, n_in), (n_hidden, n_hidden), ...
+    hidden_biases: List[Array]   # len = _N_DEPTH-1; each (n_hidden,)
+    out_weight: Array            # (n_hidden,)
+    ln_gamma: Array              # (n_hidden,) LayerNorm scale
+    ln_beta: Array               # (n_hidden,) LayerNorm shift
     name: str = "anm_nn"
 
     def __call__(self, parents: Array, source: Array) -> Array:
-        h = np.tanh(parents @ self.W1.T + self.b1)
-        return h @ self.W2 + source
+        h = parents
+        for W, b in zip(self.hidden_weights, self.hidden_biases):
+            h = np.tanh(h @ W.T + b)
+        mu = h.mean(axis=-1, keepdims=True)
+        std = h.std(axis=-1, keepdims=True) + 1e-5
+        h = (h - mu) / std * self.ln_gamma + self.ln_beta
+        return h @ self.out_weight + source
 
     def metadata(self) -> Dict[str, object]:
         return {"name": self.name}
@@ -133,23 +140,50 @@ class LocationScaleNoise(NodeMechanism):
 
 @dataclass
 class NeuralNetMechanism(NodeMechanism):
-    """Non-additive two-layer MLP: x = tanh(pa @ W1.T + s * w_s + b1) @ |W2| + c_s * s.
+    """Non-additive deep MLP: pa and s mixed in the first layer, then _N_DEPTH-1 more layers.
 
-    pa and s are mixed non-additively in the hidden layer. The residual c_s * s
-    ensures unbounded support and strict monotonicity in s:
-        dx/ds = sum_i sech²(pre_i) |w_s_i| |W2_i| + c_s >= c_s > 0.
+    The residual c_s * s ensures unbounded support and strict monotonicity in s.
+    LayerNorm is applied before the final output layer.
     """
-    W1: Array   # (n_hidden, n_parents)
-    w_s: Array  # (n_hidden,) — abs() enforced in forward pass
-    b1: Array   # (n_hidden,)
-    W2: Array   # (n_hidden,) — abs() enforced in forward pass
-    c_s: float  # strictly positive residual source coupling
+    W_in: Array          # (n_hidden, n_parents)
+    w_s: Array           # (n_hidden,) — abs() enforced in forward pass
+    b_in: Array          # (n_hidden,)
+    hidden_weights: List[Array]  # len = _N_DEPTH-2; each (n_hidden, n_hidden)
+    hidden_biases: List[Array]   # len = _N_DEPTH-2; each (n_hidden,)
+    out_weight: Array    # (n_hidden,) — abs() enforced in forward pass
+    ln_gamma: Array      # (n_hidden,) LayerNorm scale
+    ln_beta: Array       # (n_hidden,) LayerNorm shift
+    c_s: float           # strictly positive residual source coupling
     name: str = "neural_net"
 
     def __call__(self, parents: Array, source: Array) -> Array:
-        pre = parents @ self.W1.T + source[:, None] * np.abs(self.w_s) + self.b1
+        pre = parents @ self.W_in.T + source[:, None] * np.abs(self.w_s) + self.b_in
         h = np.tanh(pre)
-        return h @ np.abs(self.W2) + self.c_s * source
+        for W, b in zip(self.hidden_weights, self.hidden_biases):
+            h = np.tanh(h @ W.T + b)
+        mu = h.mean(axis=-1, keepdims=True)
+        std = h.std(axis=-1, keepdims=True) + 1e-5
+        h = (h - mu) / std * self.ln_gamma + self.ln_beta
+        return h @ np.abs(self.out_weight) + self.c_s * source
+
+    def metadata(self) -> Dict[str, object]:
+        return {"name": self.name}
+
+
+@dataclass
+class ANMGPMechanism(NodeMechanism):
+    """GP-parameterized ANM: x = GP(pa) + s (RFF approximation)."""
+    omega: Array   # (n_features, n_parents)
+    phase: Array   # (n_features,)
+    alpha: Array   # (n_features,)
+    name: str = "anm_gp"
+
+    def _rff(self, x: Array) -> Array:
+        n_feat = self.omega.shape[0]
+        return np.sqrt(2.0 / n_feat) * np.cos(x @ self.omega.T + self.phase) @ self.alpha
+
+    def __call__(self, parents: Array, source: Array) -> Array:
+        return self._rff(parents) + source
 
     def metadata(self) -> Dict[str, object]:
         return {"name": self.name}
@@ -157,28 +191,24 @@ class NeuralNetMechanism(NodeMechanism):
 
 @dataclass
 class GPMechanism(NodeMechanism):
-    """GP-parameterized location-scale: x = mu(pa) + exp(log_sigma(pa)) * s.
+    """GP-parameterized non-additive: x = GP([pa, s]) + c_s * s.
 
-    mu and log_sigma are independent RFF approximations of GP priors over parents.
-    Invertible: exp(log_sigma(pa)) > 0 always, so s = (x - mu(pa)) * exp(-log_sigma(pa)).
+    s is concatenated with parents before the RFF so it enters nonlinearly.
+    The c_s * s residual ensures strict monotonicity in s.
     """
-    omega_mu: Array   # (n_features, n_parents)
-    phase_mu: Array   # (n_features,)
-    alpha_mu: Array   # (n_features,)
-    omega_ls: Array   # (n_features, n_parents)
-    phase_ls: Array   # (n_features,)
-    alpha_ls: Array   # (n_features,)
+    omega: Array   # (n_features, n_parents + 1)
+    phase: Array   # (n_features,)
+    alpha: Array   # (n_features,)
+    c_s: float
     name: str = "gp"
 
-    def _rff(self, parents: Array, omega: Array, phase: Array, alpha: Array) -> Array:
-        n_feat = omega.shape[0]
-        z = np.sqrt(2.0 / n_feat) * np.cos(parents @ omega.T + phase)
-        return z @ alpha
+    def _rff(self, x: Array) -> Array:
+        n_feat = self.omega.shape[0]
+        return np.sqrt(2.0 / n_feat) * np.cos(x @ self.omega.T + self.phase) @ self.alpha
 
     def __call__(self, parents: Array, source: Array) -> Array:
-        mu = self._rff(parents, self.omega_mu, self.phase_mu, self.alpha_mu)
-        log_sigma = self._rff(parents, self.omega_ls, self.phase_ls, self.alpha_ls)
-        return mu + np.exp(log_sigma) * source
+        z = np.concatenate([parents, source[:, None]], axis=1)
+        return self._rff(z) + self.c_s * source
 
     def metadata(self) -> Dict[str, object]:
         return {"name": self.name}
@@ -188,10 +218,10 @@ class GPMechanism(NodeMechanism):
 # Factory
 # ---------------------------------------------------------------------------
 
-_ADDITIVE_POOL = ["linear", "anm_tanh", "anm_nn", "pnl", "lsnm"]
+_ADDITIVE_POOL = ["linear", "anm_tanh", "anm_nn", "pnl", "lsnm", "anm_gp"]
 _NONADDITIVE_POOL = ["neural_net", "gp"]
-_NOT_OBS_ID_POOL = ["linear", "neural_net", "gp"]
-_OBS_ID_POOL = ["anm_tanh", "anm_nn", "pnl", "lsnm"]
+_NOT_OBS_ID_POOL = ["linear", "gp"]
+_OBS_ID_POOL = ["anm_tanh", "anm_nn", "pnl", "lsnm", "anm_gp"]
 
 
 def build_mechanism(name: Union[str, NodeMechanism], n_parents: int, rng: np.random.Generator) -> NodeMechanism:
@@ -223,29 +253,50 @@ def build_mechanism(name: Union[str, NodeMechanism], n_parents: int, rng: np.ran
         )
 
     if key in {"anm_nn", "neural_net_anm"}:
+        hw = [rng.normal(0.0, 1.0 / np.sqrt(n_parents), size=(_N_HIDDEN, n_parents))]
+        hb = [np.zeros(_N_HIDDEN)]
+        for _ in range(_N_DEPTH - 2):
+            hw.append(rng.normal(0.0, 1.0 / np.sqrt(_N_HIDDEN), size=(_N_HIDDEN, _N_HIDDEN)))
+            hb.append(np.zeros(_N_HIDDEN))
         return NeuralNetANM(
-            W1=rng.normal(0.0, 1.0 / np.sqrt(n_parents), size=(_N_HIDDEN, n_parents)),
-            b1=np.zeros(_N_HIDDEN),
-            W2=rng.normal(0.0, 1.0 / np.sqrt(_N_HIDDEN), size=_N_HIDDEN),
+            hidden_weights=hw,
+            hidden_biases=hb,
+            out_weight=rng.normal(0.0, 1.0 / np.sqrt(_N_HIDDEN), size=_N_HIDDEN),
+            ln_gamma=np.ones(_N_HIDDEN),
+            ln_beta=np.zeros(_N_HIDDEN),
         )
 
     if key in {"nn", "neural_net"}:
+        hw = []
+        hb = []
+        for _ in range(_N_DEPTH - 2):
+            hw.append(rng.normal(0.0, 1.0 / np.sqrt(_N_HIDDEN), size=(_N_HIDDEN, _N_HIDDEN)))
+            hb.append(np.zeros(_N_HIDDEN))
         return NeuralNetMechanism(
-            W1=rng.normal(0.0, 1.0 / np.sqrt(n_parents), size=(_N_HIDDEN, n_parents)),
+            W_in=rng.normal(0.0, 1.0 / np.sqrt(n_parents), size=(_N_HIDDEN, n_parents)),
             w_s=rng.uniform(0.3, 0.7, size=_N_HIDDEN),
-            b1=np.zeros(_N_HIDDEN),
-            W2=rng.uniform(0.3, 0.7, size=_N_HIDDEN) / _N_HIDDEN,
+            b_in=np.zeros(_N_HIDDEN),
+            hidden_weights=hw,
+            hidden_biases=hb,
+            out_weight=rng.uniform(0.3, 0.7, size=_N_HIDDEN) / _N_HIDDEN,
+            ln_gamma=np.ones(_N_HIDDEN),
+            ln_beta=np.zeros(_N_HIDDEN),
             c_s=float(rng.uniform(0.3, 0.7)),
+        )
+
+    if key == "anm_gp":
+        return ANMGPMechanism(
+            omega=rng.normal(0.0, 1.0 / _GP_LENGTH_SCALE, size=(_N_RFF, n_parents)),
+            phase=rng.uniform(0.0, 2.0 * np.pi, size=_N_RFF),
+            alpha=rng.normal(0.0, 1.0, size=_N_RFF),
         )
 
     if key == "gp":
         return GPMechanism(
-            omega_mu=rng.normal(0.0, 1.0 / _GP_LENGTH_SCALE, size=(_N_RFF, n_parents)),
-            phase_mu=rng.uniform(0.0, 2.0 * np.pi, size=_N_RFF),
-            alpha_mu=rng.normal(0.0, 1.0, size=_N_RFF),
-            omega_ls=rng.normal(0.0, 1.0 / _GP_LENGTH_SCALE, size=(_N_RFF, n_parents)),
-            phase_ls=rng.uniform(0.0, 2.0 * np.pi, size=_N_RFF),
-            alpha_ls=rng.normal(0.0, 0.5, size=_N_RFF),
+            omega=rng.normal(0.0, 1.0 / _GP_LENGTH_SCALE, size=(_N_RFF, n_parents + 1)),
+            phase=rng.uniform(0.0, 2.0 * np.pi, size=_N_RFF),
+            alpha=rng.normal(0.0, 1.0, size=_N_RFF),
+            c_s=float(rng.uniform(0.3, 0.7)),
         )
 
     if key in {"mixed", "mixed_mechanism"}:

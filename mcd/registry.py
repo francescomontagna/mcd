@@ -14,9 +14,6 @@ MCD_VARIANTS = {
     "mcd-variance": "variance",
     "mcd-hessian": "hessian",
     "mcd-hsic": "hsic",
-    "mcd-pit": "pit",
-    "mcd-pit-hsic": "pit-hsic",
-    "mcd-pit-hessian": "pit-hessian",
 }
 AVAILABLE_ALGORITHMS = list(MCD_VARIANTS.keys()) + ["random"] + COMPETITOR_ALGORITHMS
 
