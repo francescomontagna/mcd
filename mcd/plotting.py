@@ -49,6 +49,7 @@ def plot_dtop_bars(results_csv: str, outdir: str) -> None:
     ax.set_ylabel("mean Dtop")
     ax.set_title("Dtop by algorithm and graph size")
     ax.set_ylim(bottom=0.0, top=1.0)
+    ax.set_yticks(np.arange(0.0, 1.1, 0.1))
     ax.legend()
     fig.tight_layout()
     fig.savefig(out / "dtop_bars.png", dpi=180)
