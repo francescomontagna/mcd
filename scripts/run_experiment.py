@@ -65,12 +65,10 @@ def main() -> None:
                              "anm/tanh (nonlinear additive noise, tanh), "
                              "pnl (post-nonlinear), "
                              "lsnm/location_scale (location-scale noise), "
-                             "tanh_cubic (non-additive tanh+cubic), "
-                             "nn/neural_net (non-additive neural network), "
                              "gp (non-additive Gaussian process), "
                              "mixed (randomly samples from all of the above per node), "
-                             "not_obs_id (uniform over linear/nn/gp — not observationally identifiable), "
-                             "obs_id (uniform over anm_tanh/anm_nn/pnl/lsnm — observationally identifiable).")
+                             "not_obs_id (uniform over linear/gp — not observationally identifiable), "
+                             "obs_id (uniform over anm_tanh/pnl/lsnm/anm_gp — observationally identifiable).")
     parser.add_argument("--algorithms", type=str, default="mcd-variance,mcd-hessian",
                         help=f"Comma-separated list, choose from: {','.join(MCD_VARIANTS.keys())},random.")
 

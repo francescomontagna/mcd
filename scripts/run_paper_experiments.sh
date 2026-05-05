@@ -29,9 +29,9 @@ unset SLURM_EXPORT_ENV
 # Sweep parameters
 #-----------------------------
 
-ALGORITHMS=("mcd-pit-hessian")
+ALGORITHMS=("nogam" "cam" "resit" "lingam")
 MECHANISMS=("obs_id" "not_obs_id")
-N_ENVS_VALUES=(3 5 7)
+N_ENVS_VALUES=(1)
 
 #-----------------------------
 # Self-submit: if not inside SLURM, compute array range and resubmit
@@ -85,7 +85,7 @@ python3 scripts/run_experiment.py \
     --algorithms "$ALGO_NAME" \
     --n-reps 20 \
     --d-list 3,5,10,20 \
-    --n-samples 500,1500,3000 \
+    --n-samples 1000,2000,3000 \
     --n-envs "$N_ENVS" \
     --density 0.8,0.5,0.25,0.25 \
     --krr-reg 1e-3 \
@@ -93,5 +93,4 @@ python3 scripts/run_experiment.py \
     --outdir "outputs/paper/$ALGO_NAME/nenvs${N_ENVS}" \
     --mechanism "$MECHANISM" \
     --shift-all-eta \
-    --min-env-diff 1.5 \
 
