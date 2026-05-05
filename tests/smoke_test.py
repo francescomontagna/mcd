@@ -19,7 +19,7 @@ def test_mcd_uses_internal_eval_split() -> None:
     assert sorted(model.order_) == list(range(3))
     assert model.adjacency_.shape == data.adjacency.shape
     assert 0.0 <= dtop(data.adjacency, model.order_) <= 1.0
-    assert model.env_split_.eval_env == -1
+    assert model.env_split_.eval_env == 3  # k=4: env 3 is dedicated eval
 
 
 def test_random_baseline_runs() -> None:
@@ -44,9 +44,6 @@ def test_current_mcd_variants_run() -> None:
         "variance",
         "hessian",
         "hsic",
-        "contrast-variance",
-        "contrast-hessian",
-        "contrast-hsic",
         "pit",
         "pit-hsic",
     ]:

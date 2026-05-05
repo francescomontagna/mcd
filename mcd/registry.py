@@ -4,23 +4,21 @@ from typing import Callable, Dict, Iterable, List
 
 from .algorithm import MCD, MCDConfig
 from .baselines import RandomOrderBaseline, RandomOrderConfig
+from .competitors import CAMWrapper, LiNGAMWrapper, NoGAMWrapper, RESITWrapper
 
 AlgorithmFactory = Callable[[int], object]
 
-# Algorithm names exposed via the registry. The plain variance/hessian/hsic
-# names now denote the bounded projective-ratio variants. The contrast-* names
-# denote the true two-vector score-contrast variants.
+COMPETITOR_ALGORITHMS = ["nogam", "cam", "lingam", "resit"]
+
 MCD_VARIANTS = {
     "mcd-variance": "variance",
     "mcd-hessian": "hessian",
     "mcd-hsic": "hsic",
-    "mcd-contrast-variance": "contrast-variance",
-    "mcd-contrast-hessian": "contrast-hessian",
-    "mcd-contrast-hsic": "contrast-hsic",
     "mcd-pit": "pit",
     "mcd-pit-hsic": "pit-hsic",
+    "mcd-pit-hessian": "pit-hessian",
 }
-AVAILABLE_ALGORITHMS = list(MCD_VARIANTS.keys()) + ["random"]
+AVAILABLE_ALGORITHMS = list(MCD_VARIANTS.keys()) + ["random"] + COMPETITOR_ALGORITHMS
 
 
 def parse_algorithm_list(text: str) -> List[str]:
@@ -61,6 +59,22 @@ def make_algorithm_factory(
     if key == "random":
         def factory(seed: int) -> RandomOrderBaseline:
             return RandomOrderBaseline(RandomOrderConfig(random_state=seed))
+        return factory
+    if key == "nogam":
+        def factory(seed: int) -> NoGAMWrapper:
+            return NoGAMWrapper(random_state=seed)
+        return factory
+    if key == "cam":
+        def factory(seed: int) -> CAMWrapper:
+            return CAMWrapper(random_state=seed)
+        return factory
+    if key == "lingam":
+        def factory(seed: int) -> LiNGAMWrapper:
+            return LiNGAMWrapper(random_state=seed)
+        return factory
+    if key == "resit":
+        def factory(seed: int) -> RESITWrapper:
+            return RESITWrapper(random_state=seed)
         return factory
     raise ValueError(
         f"Unknown algorithm: {name}. Available algorithms: {', '.join(AVAILABLE_ALGORITHMS)}"
