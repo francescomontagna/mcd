@@ -8,7 +8,7 @@ import numpy as np
 Array = np.ndarray
 
 _N_RFF = 32
-_GP_LENGTH_SCALE = 2.0
+_GP_LENGTH_SCALE = 2
 
 
 class NodeMechanism:
@@ -106,6 +106,44 @@ class LocationScaleNoise(NodeMechanism):
 
 
 # ---------------------------------------------------------------------------
+# Random neural network mechanism
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RandomNNMechanism(NodeMechanism):
+    """Random invertible NN: x = LayerNorm(MLP([pa, s]))[0].
+
+    Each layer is a square linear map followed by an invertible nonlinearity
+    (tanh or leaky_relu).  LayerNorm on the final hidden state keeps the
+    output scale bounded regardless of depth or weight scale.
+    """
+    weights: List[Array]        # depth × (dim, dim), dim = n_parents + 1
+    nonlinearities: List[str]   # depth × {'tanh' | 'leaky_relu'}
+    leaky_alpha: float = 0.2
+    residual: bool = False
+    name: str = "random_nn"
+
+    def _nonlin(self, z: Array, nl: str) -> Array:
+        if nl == "tanh":
+            return np.tanh(z)
+        return np.where(z > 0, z, self.leaky_alpha * z)
+
+    def __call__(self, parents: Array, source: Array) -> Array:
+        z = np.concatenate([parents, source[:, None]], axis=1)  # (n, dim)
+        for W, nl in zip(self.weights, self.nonlinearities):
+            h = self._nonlin(z @ W, nl)
+            z = h + z if self.residual else h
+        mu = z.mean(axis=0, keepdims=True)
+        sig = z.std(axis=0, keepdims=True) + 1e-8
+        z = (z - mu) / sig
+        return z[:, 0]
+
+    def metadata(self) -> Dict[str, object]:
+        return {"name": self.name, "depth": len(self.weights), "residual": self.residual}
+
+
+# ---------------------------------------------------------------------------
 # Non-additive mechanisms
 # ---------------------------------------------------------------------------
 
@@ -157,7 +195,8 @@ class GPMechanism(NodeMechanism):
 
 _ADDITIVE_POOL = ["linear", "anm_tanh", "pnl", "lsnm", "anm_gp"]
 _NONADDITIVE_POOL = ["gp"]
-_NOT_OBS_ID_POOL = ["linear", "gp"]
+# _NOT_OBS_ID_POOL = ["linear", "gp"]
+_NOT_OBS_ID_POOL = ["linear", "nn_residual"]
 _OBS_ID_POOL = ["anm_tanh", "pnl", "lsnm", "anm_gp"]
 
 
@@ -201,8 +240,14 @@ def build_mechanism(name: Union[str, NodeMechanism], n_parents: int, rng: np.ran
             omega=rng.normal(0.0, 1.0 / _GP_LENGTH_SCALE, size=(_N_RFF, n_parents + 1)),
             phase=rng.uniform(0.0, 2.0 * np.pi, size=_N_RFF),
             alpha=rng.normal(0.0, 1.0, size=_N_RFF),
-            c_s=float(rng.uniform(0.3, 0.7)),
+            c_s=float(rng.uniform(0.3, 0.7)), # Residual connection from source to output, needed for stability when not additive
         )
+
+    if key in {"nn", "nn_residual"}:
+        dim = n_parents + 1
+        weights = [rng.normal(1.0, 1.0, (dim, dim)) for _ in range(4)]
+        nonlins = ["tanh"] * 4
+        return RandomNNMechanism(weights=weights, nonlinearities=nonlins, residual=(key == "nn_residual"))
 
     if key in {"mixed", "mixed_mechanism"}:
         pool = _NONADDITIVE_POOL if rng.random() < 0.5 else _ADDITIVE_POOL

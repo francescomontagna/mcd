@@ -66,6 +66,8 @@ def main() -> None:
                              "pnl (post-nonlinear), "
                              "lsnm/location_scale (location-scale noise), "
                              "gp (non-additive Gaussian process), "
+                             "nn (random invertible neural network), "
+                             "nn_residual (same with residual skip connections), "
                              "mixed (randomly samples from all of the above per node), "
                              "not_obs_id (uniform over linear/gp — not observationally identifiable), "
                              "obs_id (uniform over anm_tanh/pnl/lsnm/anm_gp — observationally identifiable).")
@@ -198,6 +200,10 @@ def main() -> None:
                                 print(
                                     f"  algorithm={algorithm_name}, krr_reg={krr_reg:g}, "
                                     f"eta_stein={eta_stein:g}, dtop={row['dtop']:.4f}"
+                                )
+                            else:
+                                print(
+                                    f"  algorithm={algorithm_name}, dtop={row['dtop']:.4f}"
                                 )
                 print('\n --- \n')
 
