@@ -17,6 +17,10 @@ venv/
 env/
 ENV/
 
+# Images
+*.png
+*.pdf
+
 # Packaging / build artifacts
 *.egg-info/
 .eggs/
