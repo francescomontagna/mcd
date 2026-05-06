@@ -29,9 +29,9 @@ unset SLURM_EXPORT_ENV
 # Sweep parameters
 #-----------------------------
 
-ALGORITHMS=("mcd-hsic")
-MECHANISMS=("linear" "gp")
-N_ENVS_VALUES=(3)
+ALGORITHMS=("nogam" "cam" "resit" "lingam")
+MECHANISMS=("not_obs_id")
+N_ENVS_VALUES=(1)
 
 #-----------------------------
 # Self-submit: if not inside SLURM, compute array range and resubmit
@@ -90,7 +90,7 @@ python3 scripts/run_experiment.py \
     --density 0.8,0.5,0.25,0.25 \
     --krr-reg 1e-3 \
     --eta-stein 1e-3 \
-    --outdir "outputs/paper/new_gp/$ALGO_NAME/nenvs${N_ENVS}" \
+    --outdir "outputs/paper/$ALGO_NAME/nenvs${N_ENVS}" \
     --mechanism "$MECHANISM" \
     --shift-all-eta \
 

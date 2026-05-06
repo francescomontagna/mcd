@@ -66,3 +66,6 @@ or at least a small smoke command such as:
 ```bash
 python scripts/run_experiment.py --algorithms mcd-variance,mcd-hessian,random --n-reps 1 --d-list 3 --n-samples 20 --n-envs 4 --no-plots
 ```
+
+# Environment
+Before running the code, activate the virtual environment with `source venv/bin/activate`. If you haven't set up the environment yet, create it with `python -m venv venv` and then run `pip install -r requirements.txt` to install the necessary dependencies.
