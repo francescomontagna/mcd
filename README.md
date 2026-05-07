@@ -39,12 +39,11 @@ pytest -q
 ```bash
 python scripts/run_experiment.py \
   --outdir outputs/debug \
-  --algorithms mcd,random \
+  --algorithms mcd-variance,random \
   --n-reps 2 \
   --d-list 5 \
   --n-samples 100 \
   --n-envs 4 \
-  --sink-rule variance \
   --no-plots
 ```
 
@@ -53,7 +52,7 @@ A more serious run:
 ```bash
 python scripts/run_experiment.py \
   --outdir outputs/hessian \
-  --algorithms mcd,random \
+  --algorithms mcd-hessian,random \
   --seed 0 \
   --n-reps 10 \
   --d-list 5,10,20 \
@@ -62,7 +61,6 @@ python scripts/run_experiment.py \
   --n-envs 4 \
   --mechanism mixed \
   --noise gaussian \
-  --sink-rule hessian \
   --eta-g 1e-2 \
   --eta-h 1e-2 \
   --krr-reg 1e-4
@@ -110,12 +108,14 @@ There are no `max_score_train` or `max_eval_samples` arguments. Training and eva
 The script accepts a comma-separated algorithm list:
 
 ```bash
---algorithms mcd,random
+--algorithms mcd-variance,mcd-hessian,random
 ```
 
 Currently implemented:
 
-- `mcd`: score-ratio sink peeling.
+- `mcd-variance`: score-ratio sink peeling with the variance sink rule.
+- `mcd-hessian`: score-ratio sink peeling with the hessian sink rule.
+- `mcd-hsic`: score-ratio sink peeling with the HSIC sink rule.
 - `random`: random source-to-sink order baseline.
 
 All algorithms are run on the same generated dataset for each repetition.

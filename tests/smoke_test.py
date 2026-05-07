@@ -44,8 +44,6 @@ def test_current_mcd_variants_run() -> None:
         "variance",
         "hessian",
         "hsic",
-        "pit",
-        "pit-hsic",
     ]:
         model = MCD(MCDConfig(sink_rule=sink_rule, random_state=321, score_train_frac=0.4)).fit(data.X)
         assert sorted(model.order_) == list(range(3))
