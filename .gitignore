@@ -10,6 +10,7 @@ htmlcov/
 
 # Claude stuff
 .claude/
+CLAUDE.md
 
 # Virtual environments
 .venv/
